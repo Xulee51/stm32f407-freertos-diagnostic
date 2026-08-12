@@ -1,0 +1,5 @@
+/Build/
+*.launch
+.settings/
+.project
+.cproject
