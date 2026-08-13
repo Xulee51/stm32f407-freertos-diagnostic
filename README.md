@@ -24,3 +24,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\dev.ps1 flash
 ```
 
 串口预期每秒输出 `health bits` 和 FreeRTOS 剩余 Heap。LCD、触摸、以太网、CAN、RS485 将在基线验收后按阶段加入。
+
+学习过程中的问题与解释记录在 [`docs/学习笔记.md`](docs/学习笔记.md)。
