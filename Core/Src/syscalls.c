@@ -1,6 +1,7 @@
 #include "main.h"
 #include <sys/stat.h>
 #include <errno.h>
+#include <stdint.h>
 
 int _write(int file, char *ptr, int len)
 {
@@ -21,14 +22,20 @@ void *_sbrk(ptrdiff_t incr)
 {
     extern char _end;
     extern char _estack;
-    static char *heap_end;
-    char *prev;
-    if (heap_end == 0) heap_end = &_end;
-    prev = heap_end;
-    if ((heap_end + incr) > (&_estack - 1024)) {
+    static uintptr_t heap_end;
+    uintptr_t previous;
+    uintptr_t next;
+    const uintptr_t heap_limit = (uintptr_t)&_estack - 1024U;
+
+    if (heap_end == 0U) {
+        heap_end = (uintptr_t)&_end;
+    }
+    previous = heap_end;
+    next = (uintptr_t)((intptr_t)heap_end + incr);
+    if ((next < (uintptr_t)&_end) || (next > heap_limit)) {
         errno = ENOMEM;
         return (void *)-1;
     }
-    heap_end += incr;
-    return prev;
+    heap_end = next;
+    return (void *)previous;
 }
