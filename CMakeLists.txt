@@ -3,6 +3,18 @@ cmake_minimum_required(VERSION 3.25)
 project(freertos_robot_diagnostic C ASM)
 
 set(TARGET_NAME freertos_robot_diagnostic)
+set(DIAG_FAULT_MODE "none" CACHE STRING "Fault injection mode: none, queue, or watchdog")
+set_property(CACHE DIAG_FAULT_MODE PROPERTY STRINGS none queue watchdog)
+if(DIAG_FAULT_MODE STREQUAL "none")
+    set(DIAG_FAULT_MODE_VALUE 0)
+elseif(DIAG_FAULT_MODE STREQUAL "queue")
+    set(DIAG_FAULT_MODE_VALUE 1)
+elseif(DIAG_FAULT_MODE STREQUAL "watchdog")
+    set(DIAG_FAULT_MODE_VALUE 2)
+else()
+    message(FATAL_ERROR "DIAG_FAULT_MODE must be none, queue, or watchdog")
+endif()
+
 set(MCU_FLAGS
     -mcpu=cortex-m4
     -mthumb
@@ -23,6 +35,7 @@ set(FIRMWARE_SOURCES
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_flash.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_flash_ex.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_gpio.c
+    Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_iwdg.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_pwr.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_pwr_ex.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_rcc.c
@@ -45,6 +58,7 @@ set_target_properties(${TARGET_NAME} PROPERTIES SUFFIX ".elf")
 target_compile_definitions(${TARGET_NAME} PRIVATE
     USE_HAL_DRIVER
     STM32F407xx
+    DIAG_FAULT_MODE=${DIAG_FAULT_MODE_VALUE}
 )
 
 target_include_directories(${TARGET_NAME} PRIVATE
