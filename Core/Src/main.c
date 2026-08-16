@@ -14,6 +14,7 @@
 #define LOG_QUEUE_LENGTH 8U
 #define TASK_STACK_WORDS 384U
 #define IWDG_RELOAD_VALUE 1500U /* 约 3 秒，实际值随 LSI 频率变化 */
+#define SUPERVISOR_GRACE_TICKS pdMS_TO_TICKS(2000)
 
 /* USART1 句柄：PA9=TX、PA10=RX，供 logger 任务和启动日志使用 */
 UART_HandleTypeDef huart1;
@@ -41,6 +42,8 @@ static TaskHandle_t health_task_handle;
 static TaskHandle_t logger_task_handle;
 static TaskHandle_t ui_task_handle;
 static volatile uint32_t log_queue_dropped;
+static volatile uint32_t logger_heartbeat;
+static volatile uint32_t ui_heartbeat;
 
 static void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -102,9 +105,11 @@ static void health_task(void *argument)
     (void)argument;
     TickType_t wake = xTaskGetTickCount();
     log_message_t message;
-#if DIAG_FAULT_MODE != 0
+#if DIAG_FAULT_MODE == 1 || DIAG_FAULT_MODE == 2
     uint8_t fault_injected = 0U;
 #endif
+    uint32_t last_logger_heartbeat = 0U;
+    uint32_t last_ui_heartbeat = 0U;
     for (;;) {
         EventBits_t bits = xEventGroupGetBits(health_events);
         UBaseType_t health_hwm = uxTaskGetStackHighWaterMark(health_task_handle);
@@ -112,17 +117,27 @@ static void health_task(void *argument)
         UBaseType_t ui_hwm = uxTaskGetStackHighWaterMark(ui_task_handle);
         size_t free_heap = xPortGetFreeHeapSize();
         size_t min_free_heap = xPortGetMinimumEverFreeHeapSize();
+        TickType_t now = xTaskGetTickCount();
+        const char *supervisor = "ok";
+        if ((now >= SUPERVISOR_GRACE_TICKS) &&
+            (logger_heartbeat == last_logger_heartbeat)) {
+            supervisor = "logger_stalled";
+        } else if ((now >= SUPERVISOR_GRACE_TICKS) &&
+                   (ui_heartbeat == last_ui_heartbeat)) {
+            supervisor = "ui_stalled";
+        }
         snprintf(message.text, sizeof(message.text),
                  "health bits=0x%02lx heap=%lu min_heap=%lu qdrop=%lu "
-                 "stack_hwm=%lu/%lu/%lu wd=ok",
+                 "stack_hwm=%lu/%lu/%lu supervisor=%s wd=ok",
                  (unsigned long)bits,
                  (unsigned long)free_heap,
                  (unsigned long)min_free_heap,
                  (unsigned long)log_queue_dropped,
                  (unsigned long)health_hwm,
                  (unsigned long)logger_hwm,
-                 (unsigned long)ui_hwm);
-        message.tick = xTaskGetTickCount();
+                 (unsigned long)ui_hwm,
+                 supervisor);
+        message.tick = now;
         /* 超时 20 ms：队列满时丢弃本条，避免 health 被 logger 拖死 */
         if (xQueueSend(log_queue, &message, pdMS_TO_TICKS(20)) != pdPASS) {
             log_queue_dropped++;
@@ -148,9 +163,17 @@ static void health_task(void *argument)
         }
 #endif
 
+        if (strcmp(supervisor, "ok") != 0) {
+            uart_write("[SUPERVISOR] task heartbeat stalled; withholding IWDG refresh\r\n");
+            for (;;) {
+            }
+        }
+
         if (HAL_IWDG_Refresh(&hiwdg) != HAL_OK) {
             Error_Handler();
         }
+        last_logger_heartbeat = logger_heartbeat;
+        last_ui_heartbeat = ui_heartbeat;
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000));
     }
 }
@@ -166,10 +189,18 @@ static void logger_task(void *argument)
     char line[192];
     xEventGroupSetBits(health_events, EVT_LOGGER_OK);
     for (;;) {
+#if DIAG_FAULT_MODE == 3
+        if (xTaskGetTickCount() >= pdMS_TO_TICKS(5000)) {
+            uart_write("[FAULT] logger heartbeat stopped\r\n");
+            for (;;) {
+            }
+        }
+#endif
         if (xQueueReceive(log_queue, &message, portMAX_DELAY) == pdPASS) {
             snprintf(line, sizeof(line), "[%10lu] %s\r\n",
                      (unsigned long)message.tick, message.text);
             uart_write(line);
+            logger_heartbeat++;
         }
     }
 }
@@ -184,6 +215,7 @@ static void ui_task(void *argument)
     xEventGroupSetBits(health_events, EVT_UI_OK);
     for (;;) {
         /* ILI9806/CST716 adapters are added only after the RTOS baseline passes. */
+        ui_heartbeat++;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }

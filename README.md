@@ -57,6 +57,7 @@ cmake --preset debug -DDIAG_FAULT_MODE=queue
 - `DIAG_FAULT_MODE=none`：正常固件；
 - `DIAG_FAULT_MODE=queue`：约第 5 秒快速填充日志队列，验证 `qdrop`；
 - `DIAG_FAULT_MODE=watchdog`：约第 5 秒停止刷新 IWDG，验证自动复位。
+- `DIAG_FAULT_MODE=logger`：约第 5 秒让 logger 停止更新心跳，验证 supervisor 主动停止刷新 IWDG。
 
 ```bash
 cmake --build --preset debug
@@ -110,6 +111,10 @@ cmake --build --preset debug
 
 # 看门狗测试：约第 5 秒停止刷新，约 3 秒后复位；重启日志应显示 reset cause=IWDG
 cmake --preset debug -DDIAG_FAULT_MODE=watchdog
+cmake --build --preset debug
+
+# 任务监督测试：让 logger 卡死，supervisor 应发现并停止刷新 IWDG
+cmake --preset debug -DDIAG_FAULT_MODE=logger
 cmake --build --preset debug
 
 # 恢复正常固件配置
