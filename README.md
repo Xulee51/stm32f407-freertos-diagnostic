@@ -43,9 +43,82 @@ cmake --preset debug
 cmake --build --preset debug
 ```
 
+### 命令参数说明
+
+以上命令使用的是 Bash 语法，代码块语言应理解为 `bash`，不是 Lua。
+
+```bash
+cmake --preset debug -DDIAG_FAULT_MODE=queue
+```
+
+- `cmake`：调用 CMake 配置工具；
+- `--preset debug`：使用 `CMakePresets.json` 中名为 `debug` 的配置，选择 Ninja、ARM GCC 和 `build/debug` 输出目录；
+- `-D变量=值`：在配置阶段设置一个 CMake 缓存变量；这里把 `DIAG_FAULT_MODE` 设置为 `queue`，生成队列故障注入固件；
+- `DIAG_FAULT_MODE=none`：正常固件；
+- `DIAG_FAULT_MODE=queue`：约第 5 秒快速填充日志队列，验证 `qdrop`；
+- `DIAG_FAULT_MODE=watchdog`：约第 5 秒停止刷新 IWDG，验证自动复位。
+- `DIAG_FAULT_MODE=logger`：约第 5 秒让 logger 停止更新心跳，验证 supervisor 主动停止刷新 IWDG。
+
+```bash
+cmake --build --preset debug
+```
+
+- `--build`：让 CMake 调用已配置好的构建工具；
+- `--preset debug`：使用与 `debug` 配置对应的构建目录；
+- 这一步只编译和链接，不会烧录 MCU。
+
+```bash
+cmake --build --preset debug --target flash
+```
+
+- `--target flash`：执行 CMake 中定义的 `flash` 目标；
+- 该目标先确保固件构建成功，再调用 STM32CubeProgrammer 通过 ST-LINK 烧录并复位；
+- 不带 `--target flash` 时，默认目标只是生成 ELF/BIN，不会改变板上程序。
+
+`-D` 设置会保存在 `build/debug/CMakeCache.txt` 中，因此切换测试模式后必须明确恢复：
+
+```bash
+cmake --preset debug -DDIAG_FAULT_MODE=none
+cmake --build --preset debug
+```
+
 后续增量编译只需要：
 
 ```bash
+cmake --build --preset debug
+```
+
+## FreeRTOS 诊断指标与故障注入
+
+正常固件每秒输出当前 Heap、历史最小 Heap、队列丢包数、三个任务的栈高水位（单位：word）以及看门狗状态：
+
+```text
+[      1000] health bits=0x07 heap=... min_heap=... qdrop=0 stack_hwm=.../.../... wd=ok
+```
+
+IWDG 使用 LSI，约 3 秒超时，由 `health_task` 每秒刷新。启动日志会报告上一次是否由 IWDG 复位：
+
+```text
+[BOOT] reset cause=IWDG
+```
+
+故障注入只用于测试固件，不要把测试配置烧录成长期运行版本：
+
+```bash
+# 队列满测试：约第 5 秒产生 qdrop > 0
+cmake --preset debug -DDIAG_FAULT_MODE=queue
+cmake --build --preset debug
+
+# 看门狗测试：约第 5 秒停止刷新，约 3 秒后复位；重启日志应显示 reset cause=IWDG
+cmake --preset debug -DDIAG_FAULT_MODE=watchdog
+cmake --build --preset debug
+
+# 任务监督测试：让 logger 卡死，supervisor 应发现并停止刷新 IWDG
+cmake --preset debug -DDIAG_FAULT_MODE=logger
+cmake --build --preset debug
+
+# 恢复正常固件配置
+cmake --preset debug -DDIAG_FAULT_MODE=none
 cmake --build --preset debug
 ```
 
