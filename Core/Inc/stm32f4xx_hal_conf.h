@@ -10,6 +10,7 @@
 #define HAL_IWDG_MODULE_ENABLED
 #define HAL_PWR_MODULE_ENABLED
 #define HAL_RCC_MODULE_ENABLED
+#define HAL_SRAM_MODULE_ENABLED
 #define HAL_UART_MODULE_ENABLED
 
 #define HSE_VALUE              8000000U    /* 开发板外部晶振 8 MHz */
@@ -33,6 +34,7 @@
 #include "stm32f4xx_hal_cortex.h"
 #include "stm32f4xx_hal_flash.h"
 #include "stm32f4xx_hal_pwr.h"
+#include "stm32f4xx_hal_sram.h"
 #include "stm32f4xx_hal_uart.h"
 
 #ifdef USE_FULL_ASSERT

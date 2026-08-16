@@ -1,4 +1,6 @@
 #include "main.h"
+#include "lcd_ili9806.h"
+#include "cst716.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
@@ -44,6 +46,8 @@ static TaskHandle_t ui_task_handle;
 static volatile uint32_t log_queue_dropped;
 static volatile uint32_t logger_heartbeat;
 static volatile uint32_t ui_heartbeat;
+static uint8_t lcd_ready;
+static uint8_t touch_ready;
 
 static void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -69,6 +73,28 @@ int main(void)
     uart_write("[BOOT] STM32F407ZGT6 168 MHz, USART1 115200\r\n");
     uart_write(iwdg_reset != 0U ? "[BOOT] reset cause=IWDG\r\n"
                                : "[BOOT] reset cause=other\r\n");
+
+    /* 节点 2：在调度器启动前完成 LCD 总线初始化，便于串口报告失败层。 */
+    if (LCD_ILI9806_Init() == HAL_OK) {
+        lcd_ready = LCD_ILI9806_IsReady();
+        LCD_ILI9806_ShowTestPattern();
+        uart_write("[LCD] ILI9806 FSMC init OK, test pattern written\r\n");
+    } else {
+        uart_write("[LCD] ILI9806 FSMC init FAILED\r\n");
+    }
+
+    /* 节点 3：保持软件 I2C 轮询，先验证 CST716 总线和坐标格式。 */
+    uint16_t touch_version = 0U;
+    if (CST716_Init(&touch_version) == HAL_OK) {
+        touch_ready = 1U;
+        char touch_line[64];
+        snprintf(touch_line, sizeof(touch_line),
+                 "[TP] CST716 init OK version=0x%04x poll=on\r\n",
+                 touch_version);
+        uart_write(touch_line);
+    } else {
+        uart_write("[TP] CST716 init FAILED\r\n");
+    }
 
     log_queue = xQueueCreate(LOG_QUEUE_LENGTH, sizeof(log_message_t));
     health_events = xEventGroupCreate();
@@ -207,16 +233,39 @@ static void logger_task(void *argument)
 
 /*
  * UI 占位任务：当前只置位 EVT_UI_OK 并周期休眠。
- * ILI9806 / CST716 等显示与触摸适配，等 RTOS 基线验收后再加入。
+ * ILI9806 已在启动阶段初始化；CST716 由 UI 任务以 50 ms 周期轮询。
  */
 static void ui_task(void *argument)
 {
     (void)argument;
-    xEventGroupSetBits(health_events, EVT_UI_OK);
+    CST716_TouchSample sample;
+    log_message_t message;
+    uint8_t was_pressed = 0U;
+    if (lcd_ready != 0U) {
+        xEventGroupSetBits(health_events, EVT_UI_OK);
+    }
     for (;;) {
-        /* ILI9806/CST716 adapters are added only after the RTOS baseline passes. */
+        /* 触摸屏仍保持独立增量；本节点只验收 LCD。 */
+        if (touch_ready != 0U && CST716_Poll(&sample) == HAL_OK) {
+            if (sample.pressed != 0U && was_pressed == 0U) {
+                message.tick = xTaskGetTickCount();
+                snprintf(message.text, sizeof(message.text),
+                         "touch press x=%u y=%u fingers=%u",
+                         sample.x, sample.y, sample.fingers);
+                if (xQueueSend(log_queue, &message, 0U) != pdPASS) {
+                    log_queue_dropped++;
+                }
+            } else if (sample.pressed == 0U && was_pressed != 0U) {
+                message.tick = xTaskGetTickCount();
+                snprintf(message.text, sizeof(message.text), "touch release");
+                if (xQueueSend(log_queue, &message, 0U) != pdPASS) {
+                    log_queue_dropped++;
+                }
+            }
+            was_pressed = sample.pressed;
+        }
         ui_heartbeat++;
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 

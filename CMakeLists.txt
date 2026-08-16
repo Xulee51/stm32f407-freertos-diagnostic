@@ -5,6 +5,14 @@ project(freertos_robot_diagnostic C ASM)
 set(TARGET_NAME freertos_robot_diagnostic)
 set(DIAG_FAULT_MODE "none" CACHE STRING "Fault injection mode: none, queue, or watchdog")
 set_property(CACHE DIAG_FAULT_MODE PROPERTY STRINGS none queue watchdog logger)
+set(LCD_ILI9806_LANDSCAPE 0 CACHE STRING "ILI9806 orientation: 0=portrait, 1=landscape")
+set(LCD_BACKLIGHT_ACTIVE_HIGH 0 CACHE STRING "LCD backlight polarity: 0=active-low, 1=active-high")
+if(NOT LCD_ILI9806_LANDSCAPE STREQUAL "0" AND NOT LCD_ILI9806_LANDSCAPE STREQUAL "1")
+    message(FATAL_ERROR "LCD_ILI9806_LANDSCAPE must be 0 or 1")
+endif()
+if(NOT LCD_BACKLIGHT_ACTIVE_HIGH STREQUAL "0" AND NOT LCD_BACKLIGHT_ACTIVE_HIGH STREQUAL "1")
+    message(FATAL_ERROR "LCD_BACKLIGHT_ACTIVE_HIGH must be 0 or 1")
+endif()
 if(DIAG_FAULT_MODE STREQUAL "none")
     set(DIAG_FAULT_MODE_VALUE 0)
 elseif(DIAG_FAULT_MODE STREQUAL "queue")
@@ -42,7 +50,11 @@ set(FIRMWARE_SOURCES
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_pwr_ex.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_rcc.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_rcc_ex.c
+    Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_sram.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_uart.c
+    Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_ll_fsmc.c
+    Core/Src/lcd_ili9806.c
+    Core/Src/cst716.c
     Middlewares/FreeRTOS/Source/croutine.c
     Middlewares/FreeRTOS/Source/event_groups.c
     Middlewares/FreeRTOS/Source/list.c
@@ -61,6 +73,8 @@ target_compile_definitions(${TARGET_NAME} PRIVATE
     USE_HAL_DRIVER
     STM32F407xx
     DIAG_FAULT_MODE=${DIAG_FAULT_MODE_VALUE}
+    LCD_ILI9806_LANDSCAPE=${LCD_ILI9806_LANDSCAPE}
+    LCD_BACKLIGHT_ACTIVE_HIGH=${LCD_BACKLIGHT_ACTIVE_HIGH}
 )
 
 target_include_directories(${TARGET_NAME} PRIVATE
