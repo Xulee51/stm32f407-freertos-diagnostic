@@ -10,7 +10,7 @@ typedef struct {
     uint8_t pressed;
 } CST716_TouchSample;
 
-/* Initializes PB0/PF11 software I2C, PB1 INT input, and PC13 reset. */
+/* Initializes PB0/PF11 software I2C, PB1 EXTI wake-up, and PC13 reset. */
 HAL_StatusTypeDef CST716_Init(uint16_t *version);
 
 /* Polls the CST716 status register and returns the first touch point. */

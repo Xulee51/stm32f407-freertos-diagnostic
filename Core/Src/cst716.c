@@ -239,6 +239,21 @@ HAL_StatusTypeDef CST716_Init(uint16_t *version)
         return HAL_ERROR;
     }
 
+    /*
+     * The controller's INT line is only a wake-up hint. The ISR must not
+     * perform software-I2C transactions; ui_task owns all register reads
+     * and also polls periodically as a fallback.
+     */
+    gpio.Pin = GPIO_PIN_1;
+    gpio.Mode = GPIO_MODE_IT_RISING_FALLING;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOB, &gpio);
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_1);
+    HAL_NVIC_SetPriority(EXTI1_IRQn, 5U, 0U);
+    HAL_NVIC_ClearPendingIRQ(EXTI1_IRQn);
+    HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+
     if (version != NULL) {
         *version = (uint16_t)(((uint16_t)version_bytes[0] << 8) |
                               version_bytes[1]);

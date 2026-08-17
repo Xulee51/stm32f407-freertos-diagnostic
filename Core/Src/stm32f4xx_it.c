@@ -24,3 +24,10 @@ void SysTick_Handler(void)
         xPortSysTickHandler();
     }
 }
+
+/* PB1 / EXTI1 only acknowledges the edge; the application callback wakes
+ * ui_task, which performs the CST716 software-I2C transaction in task mode. */
+void EXTI1_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_1);
+}

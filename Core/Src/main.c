@@ -46,6 +46,7 @@ static TaskHandle_t ui_task_handle;
 static volatile uint32_t log_queue_dropped;
 static volatile uint32_t logger_heartbeat;
 static volatile uint32_t ui_heartbeat;
+static volatile uint32_t touch_irq_count;
 static uint8_t lcd_ready;
 static uint8_t touch_ready;
 
@@ -89,7 +90,7 @@ int main(void)
         touch_ready = 1U;
         char touch_line[64];
         snprintf(touch_line, sizeof(touch_line),
-                 "[TP] CST716 init OK version=0x%04x poll=on\r\n",
+                 "[TP] CST716 init OK version=0x%04x exti=both+poll\r\n",
                  touch_version);
         uart_write(touch_line);
     } else {
@@ -153,12 +154,13 @@ static void health_task(void *argument)
             supervisor = "ui_stalled";
         }
         snprintf(message.text, sizeof(message.text),
-                 "health bits=0x%02lx heap=%lu min_heap=%lu qdrop=%lu "
+                 "health bits=0x%02lx heap=%lu min_heap=%lu qdrop=%lu tirq=%lu "
                  "stack_hwm=%lu/%lu/%lu supervisor=%s wd=ok",
                  (unsigned long)bits,
                  (unsigned long)free_heap,
                  (unsigned long)min_free_heap,
                  (unsigned long)log_queue_dropped,
+                 (unsigned long)touch_irq_count,
                  (unsigned long)health_hwm,
                  (unsigned long)logger_hwm,
                  (unsigned long)ui_hwm,
@@ -245,7 +247,9 @@ static void ui_task(void *argument)
         xEventGroupSetBits(health_events, EVT_UI_OK);
     }
     for (;;) {
-        /* 触摸屏仍保持独立增量；本节点只验收 LCD。 */
+        /* EXTI wakes this task early; timeout polling detects missed edges
+         * and guarantees release detection if the controller line is noisy. */
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
         if (touch_ready != 0U && CST716_Poll(&sample) == HAL_OK) {
             if (sample.pressed != 0U && was_pressed == 0U) {
                 message.tick = xTaskGetTickCount();
@@ -265,7 +269,21 @@ static void ui_task(void *argument)
             was_pressed = sample.pressed;
         }
         ui_heartbeat++;
-        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+/* Called by HAL_GPIO_EXTI_IRQHandler() from EXTI1_IRQHandler(). */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_1) {
+        BaseType_t higher_priority_task_woken = pdFALSE;
+        touch_irq_count++;
+        if ((touch_ready != 0U) && (ui_task_handle != NULL) &&
+            (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)) {
+            vTaskNotifyGiveFromISR(ui_task_handle,
+                                   &higher_priority_task_woken);
+            portYIELD_FROM_ISR(higher_priority_task_woken);
+        }
     }
 }
 
