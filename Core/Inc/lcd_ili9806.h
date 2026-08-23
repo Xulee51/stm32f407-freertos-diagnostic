@@ -27,6 +27,11 @@
 
 HAL_StatusTypeDef LCD_ILI9806_Init(void);
 void LCD_ILI9806_ShowTestPattern(void);
+void LCD_ILI9806_Clear(uint16_t color);
+void LCD_ILI9806_FillRect(uint16_t x0, uint16_t y0,
+                          uint16_t x1, uint16_t y1, uint16_t color);
+void LCD_ILI9806_DrawText(uint16_t x, uint16_t y, const char *text,
+                          uint16_t color, uint16_t scale);
 uint8_t LCD_ILI9806_IsReady(void);
 
 #endif /* LCD_ILI9806_H */

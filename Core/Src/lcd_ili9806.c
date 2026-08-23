@@ -88,31 +88,69 @@ static const uint8_t *lcd_glyph(char c)
 {
     static const uint8_t blank[5] = {0, 0, 0, 0, 0};
     static const uint8_t glyph_0[5] = {0x3E, 0x51, 0x49, 0x45, 0x3E};
+    static const uint8_t glyph_1[5] = {0x00, 0x42, 0x7F, 0x40, 0x00};
+    static const uint8_t glyph_2[5] = {0x42, 0x61, 0x51, 0x49, 0x46};
+    static const uint8_t glyph_3[5] = {0x21, 0x41, 0x45, 0x4B, 0x31};
+    static const uint8_t glyph_4[5] = {0x18, 0x14, 0x12, 0x7F, 0x10};
+    static const uint8_t glyph_5[5] = {0x27, 0x45, 0x45, 0x45, 0x39};
     static const uint8_t glyph_6[5] = {0x1E, 0x29, 0x49, 0x49, 0x06};
+    static const uint8_t glyph_7[5] = {0x01, 0x71, 0x09, 0x05, 0x03};
     static const uint8_t glyph_8[5] = {0x36, 0x49, 0x49, 0x49, 0x36};
     static const uint8_t glyph_9[5] = {0x30, 0x49, 0x49, 0x4A, 0x3C};
+    static const uint8_t glyph_A[5] = {0x7E, 0x11, 0x11, 0x11, 0x7E};
     static const uint8_t glyph_C[5] = {0x3E, 0x41, 0x41, 0x41, 0x22};
+    static const uint8_t glyph_D[5] = {0x7F, 0x41, 0x41, 0x22, 0x1C};
+    static const uint8_t glyph_E[5] = {0x7F, 0x49, 0x49, 0x49, 0x41};
     static const uint8_t glyph_F[5] = {0x7F, 0x09, 0x09, 0x09, 0x01};
+    static const uint8_t glyph_H[5] = {0x7F, 0x08, 0x08, 0x08, 0x7F};
     static const uint8_t glyph_I[5] = {0x00, 0x41, 0x7F, 0x41, 0x00};
     static const uint8_t glyph_K[5] = {0x7F, 0x08, 0x14, 0x22, 0x41};
     static const uint8_t glyph_L[5] = {0x7F, 0x40, 0x40, 0x40, 0x40};
     static const uint8_t glyph_M[5] = {0x7F, 0x02, 0x0C, 0x02, 0x7F};
+    static const uint8_t glyph_N[5] = {0x7F, 0x02, 0x0C, 0x10, 0x7F};
     static const uint8_t glyph_O[5] = {0x3E, 0x41, 0x41, 0x41, 0x3E};
+    static const uint8_t glyph_P[5] = {0x7F, 0x09, 0x09, 0x09, 0x06};
+    static const uint8_t glyph_Q[5] = {0x3E, 0x41, 0x51, 0x21, 0x5E};
+    static const uint8_t glyph_R[5] = {0x7F, 0x09, 0x19, 0x29, 0x46};
     static const uint8_t glyph_S[5] = {0x46, 0x49, 0x49, 0x49, 0x31};
+    static const uint8_t glyph_T[5] = {0x01, 0x01, 0x7F, 0x01, 0x01};
+    static const uint8_t glyph_U[5] = {0x3F, 0x40, 0x40, 0x40, 0x3F};
+    static const uint8_t glyph_V[5] = {0x1F, 0x20, 0x40, 0x20, 0x1F};
+    static const uint8_t glyph_X[5] = {0x63, 0x14, 0x08, 0x14, 0x63};
+    static const uint8_t glyph_Y[5] = {0x07, 0x08, 0x70, 0x08, 0x07};
 
     switch (c) {
     case '0': return glyph_0;
+    case '1': return glyph_1;
+    case '2': return glyph_2;
+    case '3': return glyph_3;
+    case '4': return glyph_4;
+    case '5': return glyph_5;
     case '6': return glyph_6;
+    case '7': return glyph_7;
     case '8': return glyph_8;
     case '9': return glyph_9;
+    case 'A': return glyph_A;
     case 'C': return glyph_C;
+    case 'D': return glyph_D;
+    case 'E': return glyph_E;
     case 'F': return glyph_F;
+    case 'H': return glyph_H;
     case 'I': return glyph_I;
     case 'K': return glyph_K;
     case 'L': return glyph_L;
     case 'M': return glyph_M;
+    case 'N': return glyph_N;
     case 'O': return glyph_O;
+    case 'P': return glyph_P;
+    case 'Q': return glyph_Q;
+    case 'R': return glyph_R;
     case 'S': return glyph_S;
+    case 'T': return glyph_T;
+    case 'U': return glyph_U;
+    case 'V': return glyph_V;
+    case 'X': return glyph_X;
+    case 'Y': return glyph_Y;
     default: return blank;
     }
 }
@@ -310,6 +348,30 @@ HAL_StatusTypeDef LCD_ILI9806_Init(void)
     lcd_set_backlight(1U);
     lcd_ready = 1U;
     return HAL_OK;
+}
+
+void LCD_ILI9806_Clear(uint16_t color)
+{
+    if (lcd_ready != 0U) {
+        lcd_fill_rect(0U, 0U, LCD_ILI9806_WIDTH - 1U,
+                      LCD_ILI9806_HEIGHT - 1U, color);
+    }
+}
+
+void LCD_ILI9806_FillRect(uint16_t x0, uint16_t y0,
+                          uint16_t x1, uint16_t y1, uint16_t color)
+{
+    if (lcd_ready != 0U) {
+        lcd_fill_rect(x0, y0, x1, y1, color);
+    }
+}
+
+void LCD_ILI9806_DrawText(uint16_t x, uint16_t y, const char *text,
+                          uint16_t color, uint16_t scale)
+{
+    if ((lcd_ready != 0U) && (text != NULL) && (scale != 0U)) {
+        lcd_draw_text(x, y, text, color, scale);
+    }
 }
 
 void LCD_ILI9806_ShowTestPattern(void)

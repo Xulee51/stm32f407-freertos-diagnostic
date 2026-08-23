@@ -14,9 +14,16 @@
 #endif
 
 #define LOG_QUEUE_LENGTH 8U
+#define UI_EVENT_QUEUE_LENGTH 8U
 #define TASK_STACK_WORDS 384U
+#define INPUT_TASK_STACK_WORDS 256U
 #define IWDG_RELOAD_VALUE 1500U /* 约 3 秒，实际值随 LSI 频率变化 */
 #define SUPERVISOR_GRACE_TICKS pdMS_TO_TICKS(2000)
+#define UI_REFRESH_TICKS pdMS_TO_TICKS(500)
+
+#define LCD_COLOR_BLUE 0x001FU
+#define LCD_COLOR_WHITE 0xFFFFU
+#define LCD_COLOR_CYAN 0x07FFU
 
 /* USART1 句柄：PA9=TX、PA10=RX，供 logger 任务和启动日志使用 */
 UART_HandleTypeDef huart1;
@@ -29,8 +36,22 @@ IWDG_HandleTypeDef hiwdg;
 enum {
     EVT_BOOT_OK = 1U << 0,    /* main() 创建完对象后置位 */
     EVT_LOGGER_OK = 1U << 1,  /* logger 任务进入循环前置位 */
-    EVT_UI_OK = 1U << 2       /* ui 任务进入循环前置位 */
+    EVT_UI_OK = 1U << 2,      /* ui 任务进入循环前置位 */
+    EVT_INPUT_OK = 1U << 3    /* input 任务进入循环前置位 */
 };
+
+typedef enum {
+    UI_EVENT_TOUCH_PRESS = 1U,
+    UI_EVENT_TOUCH_RELEASE = 2U
+} ui_event_type_t;
+
+typedef struct {
+    TickType_t tick;
+    ui_event_type_t type;
+    uint16_t x;
+    uint16_t y;
+    uint8_t fingers;
+} ui_event_t;
 
 /* 任务间日志消息：tick 为发送时刻，text 为负载（不含换行） */
 typedef struct {
@@ -39,12 +60,16 @@ typedef struct {
 } log_message_t;
 
 static QueueHandle_t log_queue;           /* health -> logger，容量 8 条 */
+static QueueHandle_t ui_event_queue;      /* input -> ui，容量 8 个事件 */
 static EventGroupHandle_t health_events;  /* 跨任务共享的健康状态位 */
 static TaskHandle_t health_task_handle;
 static TaskHandle_t logger_task_handle;
+static TaskHandle_t input_task_handle;
 static TaskHandle_t ui_task_handle;
 static volatile uint32_t log_queue_dropped;
+static volatile uint32_t ui_event_dropped;
 static volatile uint32_t logger_heartbeat;
+static volatile uint32_t input_heartbeat;
 static volatile uint32_t ui_heartbeat;
 static volatile uint32_t touch_irq_count;
 static uint8_t lcd_ready;
@@ -56,8 +81,11 @@ static void MX_USART1_UART_Init(void);
 static void MX_IWDG_Init(void);
 static void logger_task(void *argument);
 static void health_task(void *argument);
+static void input_task(void *argument);
 static void ui_task(void *argument);
 static void uart_write(const char *text);
+static void ui_render_status(const ui_event_t *last_event,
+                             uint32_t event_count);
 
 int main(void)
 {
@@ -98,19 +126,25 @@ int main(void)
     }
 
     log_queue = xQueueCreate(LOG_QUEUE_LENGTH, sizeof(log_message_t));
+    ui_event_queue = xQueueCreate(UI_EVENT_QUEUE_LENGTH, sizeof(ui_event_t));
     health_events = xEventGroupCreate();
-    if ((log_queue == NULL) || (health_events == NULL)) {
+    if ((log_queue == NULL) || (ui_event_queue == NULL) ||
+        (health_events == NULL)) {
         Error_Handler();        /* Heap 不足或创建失败，停机便于排查 */
     }
 
     /*
-     * 三个最小任务：health 采状态，logger 统一出串口，ui 为后续 LCD 预留。
-     * 栈 384 word = 1536 字节；优先级数字越大越高（health=4, logger=3, ui=1）。
+     * 四个任务：health 采状态，logger 统一出串口，input 采集触摸，
+     * ui 独占 LCD 并消费 UI 事件。输入和显示分开，便于定位阻塞来源。
+     * 普通任务栈 384 word，input 使用 256 word；优先级为 health=4、
+     * logger=3、input=2、ui=1。
      */
     if (xTaskCreate(health_task, "health", TASK_STACK_WORDS, NULL, 4,
                     &health_task_handle) != pdPASS ||
         xTaskCreate(logger_task, "logger", TASK_STACK_WORDS, NULL, 3,
                     &logger_task_handle) != pdPASS ||
+        xTaskCreate(input_task, "input", INPUT_TASK_STACK_WORDS, NULL, 2,
+                    &input_task_handle) != pdPASS ||
         xTaskCreate(ui_task, "ui", TASK_STACK_WORDS, NULL, 1,
                     &ui_task_handle) != pdPASS) {
         Error_Handler();
@@ -136,11 +170,13 @@ static void health_task(void *argument)
     uint8_t fault_injected = 0U;
 #endif
     uint32_t last_logger_heartbeat = 0U;
+    uint32_t last_input_heartbeat = 0U;
     uint32_t last_ui_heartbeat = 0U;
     for (;;) {
         EventBits_t bits = xEventGroupGetBits(health_events);
         UBaseType_t health_hwm = uxTaskGetStackHighWaterMark(health_task_handle);
         UBaseType_t logger_hwm = uxTaskGetStackHighWaterMark(logger_task_handle);
+        UBaseType_t input_hwm = uxTaskGetStackHighWaterMark(input_task_handle);
         UBaseType_t ui_hwm = uxTaskGetStackHighWaterMark(ui_task_handle);
         size_t free_heap = xPortGetFreeHeapSize();
         size_t min_free_heap = xPortGetMinimumEverFreeHeapSize();
@@ -150,19 +186,25 @@ static void health_task(void *argument)
             (logger_heartbeat == last_logger_heartbeat)) {
             supervisor = "logger_stalled";
         } else if ((now >= SUPERVISOR_GRACE_TICKS) &&
+                   (input_heartbeat == last_input_heartbeat)) {
+            supervisor = "input_stalled";
+        } else if ((now >= SUPERVISOR_GRACE_TICKS) &&
                    (ui_heartbeat == last_ui_heartbeat)) {
             supervisor = "ui_stalled";
         }
         snprintf(message.text, sizeof(message.text),
-                 "health bits=0x%02lx heap=%lu min_heap=%lu qdrop=%lu tirq=%lu "
-                 "stack_hwm=%lu/%lu/%lu supervisor=%s wd=ok",
+                 "health bits=0x%02lx heap=%lu min_heap=%lu qdrop=%lu "
+                 "edrop=%lu tirq=%lu stack_hwm=%lu/%lu/%lu/%lu "
+                 "supervisor=%s wd=ok",
                  (unsigned long)bits,
                  (unsigned long)free_heap,
                  (unsigned long)min_free_heap,
                  (unsigned long)log_queue_dropped,
+                 (unsigned long)ui_event_dropped,
                  (unsigned long)touch_irq_count,
                  (unsigned long)health_hwm,
                  (unsigned long)logger_hwm,
+                 (unsigned long)input_hwm,
                  (unsigned long)ui_hwm,
                  supervisor);
         message.tick = now;
@@ -201,6 +243,7 @@ static void health_task(void *argument)
             Error_Handler();
         }
         last_logger_heartbeat = logger_heartbeat;
+        last_input_heartbeat = input_heartbeat;
         last_ui_heartbeat = ui_heartbeat;
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000));
     }
@@ -234,42 +277,125 @@ static void logger_task(void *argument)
 }
 
 /*
- * UI 占位任务：当前只置位 EVT_UI_OK 并周期休眠。
- * ILI9806 已在启动阶段初始化；CST716 由 UI 任务以 50 ms 周期轮询。
+ * 输入任务：只负责 CST716 采样和触摸状态沿检测。
+ * EXTI 只唤醒本任务，真正的 I2C 访问仍在任务上下文中完成。
  */
-static void ui_task(void *argument)
+static void input_task(void *argument)
 {
     (void)argument;
     CST716_TouchSample sample;
-    log_message_t message;
+    ui_event_t event;
     uint8_t was_pressed = 0U;
-    if (lcd_ready != 0U) {
-        xEventGroupSetBits(health_events, EVT_UI_OK);
-    }
+    uint16_t last_x = 0U;
+    uint16_t last_y = 0U;
+
+    xEventGroupSetBits(health_events, EVT_INPUT_OK);
     for (;;) {
-        /* EXTI wakes this task early; timeout polling detects missed edges
-         * and guarantees release detection if the controller line is noisy. */
+        /* 50 ms 超时是回退轮询；PB1 EXTI 到来时会提前唤醒。 */
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
         if (touch_ready != 0U && CST716_Poll(&sample) == HAL_OK) {
             if (sample.pressed != 0U && was_pressed == 0U) {
-                message.tick = xTaskGetTickCount();
-                snprintf(message.text, sizeof(message.text),
-                         "touch press x=%u y=%u fingers=%u",
-                         sample.x, sample.y, sample.fingers);
-                if (xQueueSend(log_queue, &message, 0U) != pdPASS) {
-                    log_queue_dropped++;
+                event.tick = xTaskGetTickCount();
+                event.type = UI_EVENT_TOUCH_PRESS;
+                event.x = sample.x;
+                event.y = sample.y;
+                event.fingers = sample.fingers;
+                last_x = sample.x;
+                last_y = sample.y;
+                if (xQueueSend(ui_event_queue, &event, 0U) != pdPASS) {
+                    ui_event_dropped++;
                 }
             } else if (sample.pressed == 0U && was_pressed != 0U) {
-                message.tick = xTaskGetTickCount();
-                snprintf(message.text, sizeof(message.text), "touch release");
-                if (xQueueSend(log_queue, &message, 0U) != pdPASS) {
-                    log_queue_dropped++;
+                event.tick = xTaskGetTickCount();
+                event.type = UI_EVENT_TOUCH_RELEASE;
+                event.x = last_x;
+                event.y = last_y;
+                event.fingers = 0U;
+                if (xQueueSend(ui_event_queue, &event, 0U) != pdPASS) {
+                    ui_event_dropped++;
                 }
             }
             was_pressed = sample.pressed;
         }
+        input_heartbeat++;
+    }
+}
+
+/* UI 任务独占 LCD，同时消费 input_task 产生的事件队列。 */
+static void ui_task(void *argument)
+{
+    (void)argument;
+    ui_event_t event;
+    ui_event_t last_event = {0};
+    TickType_t next_refresh = xTaskGetTickCount();
+    uint32_t event_count = 0U;
+
+    if (lcd_ready != 0U) {
+        xEventGroupSetBits(health_events, EVT_UI_OK);
+    }
+    for (;;) {
+        TickType_t now = xTaskGetTickCount();
+        TickType_t wait_ticks = (next_refresh > now) ?
+                                (next_refresh - now) : 0U;
+        if (xQueueReceive(ui_event_queue, &event, wait_ticks) == pdPASS) {
+            log_message_t message;
+            last_event = event;
+            event_count++;
+            message.tick = event.tick;
+            if (event.type == UI_EVENT_TOUCH_PRESS) {
+                snprintf(message.text, sizeof(message.text),
+                         "touch press x=%u y=%u fingers=%u",
+                         event.x, event.y, event.fingers);
+            } else {
+                snprintf(message.text, sizeof(message.text),
+                         "touch release x=%u y=%u", event.x, event.y);
+            }
+            if (xQueueSend(log_queue, &message, 0U) != pdPASS) {
+                log_queue_dropped++;
+            }
+        }
+
+        now = xTaskGetTickCount();
+        if (now >= next_refresh) {
+            ui_render_status(&last_event, event_count);
+            next_refresh = now + UI_REFRESH_TICKS;
+        }
         ui_heartbeat++;
     }
+}
+
+static void ui_render_status(const ui_event_t *last_event,
+                             uint32_t event_count)
+{
+    char line[32];
+    EventBits_t bits = xEventGroupGetBits(health_events);
+    uint16_t x = (last_event != NULL) ? last_event->x : 0U;
+    uint16_t y = (last_event != NULL) ? last_event->y : 0U;
+    uint32_t type = (last_event != NULL) ? (uint32_t)last_event->type : 0U;
+
+    if (lcd_ready == 0U) {
+        return;
+    }
+
+    /* Only redraw the status panel; the startup test pattern remains above. */
+    LCD_ILI9806_FillRect(20U, 210U, LCD_ILI9806_WIDTH - 21U,
+                         600U, LCD_COLOR_BLUE);
+    LCD_ILI9806_DrawText(28U, 220U, "RTOS", LCD_COLOR_WHITE, 3U);
+
+    snprintf(line, sizeof(line), "HEALTH%02lu", (unsigned long)(bits & 0x0FU));
+    LCD_ILI9806_DrawText(28U, 270U, line, LCD_COLOR_CYAN, 3U);
+    snprintf(line, sizeof(line), "HEAP%05lu",
+             (unsigned long)xPortGetFreeHeapSize());
+    LCD_ILI9806_DrawText(28U, 320U, line, LCD_COLOR_WHITE, 3U);
+    LCD_ILI9806_DrawText(28U, 370U, "TOUCH", LCD_COLOR_CYAN, 3U);
+    snprintf(line, sizeof(line), "X%03uY%03u", x, y);
+    LCD_ILI9806_DrawText(28U, 420U, line, LCD_COLOR_WHITE, 3U);
+    snprintf(line, sizeof(line), "TYPE%u", (unsigned int)type);
+    LCD_ILI9806_DrawText(28U, 470U, line, LCD_COLOR_CYAN, 3U);
+    snprintf(line, sizeof(line), "EVENT%05lu", (unsigned long)event_count);
+    LCD_ILI9806_DrawText(28U, 520U, line, LCD_COLOR_WHITE, 3U);
+    snprintf(line, sizeof(line), "DROP%03lu", (unsigned long)ui_event_dropped);
+    LCD_ILI9806_DrawText(28U, 570U, line, LCD_COLOR_CYAN, 3U);
 }
 
 /* Called by HAL_GPIO_EXTI_IRQHandler() from EXTI1_IRQHandler(). */
@@ -278,9 +404,9 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     if (GPIO_Pin == GPIO_PIN_1) {
         BaseType_t higher_priority_task_woken = pdFALSE;
         touch_irq_count++;
-        if ((touch_ready != 0U) && (ui_task_handle != NULL) &&
+        if ((touch_ready != 0U) && (input_task_handle != NULL) &&
             (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)) {
-            vTaskNotifyGiveFromISR(ui_task_handle,
+            vTaskNotifyGiveFromISR(input_task_handle,
                                    &higher_priority_task_woken);
             portYIELD_FROM_ISR(higher_priority_task_woken);
         }
