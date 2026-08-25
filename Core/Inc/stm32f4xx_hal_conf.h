@@ -1,8 +1,9 @@
 #ifndef STM32F4XX_HAL_CONF_H
 #define STM32F4XX_HAL_CONF_H
 
-/* 当前基线只用到时钟、GPIO、UART 及相关支撑模块 */
+/* 当前基线启用的 HAL 外设与支撑模块 */
 #define HAL_MODULE_ENABLED
+#define HAL_CAN_MODULE_ENABLED
 #define HAL_CORTEX_MODULE_ENABLED
 #define HAL_DMA_MODULE_ENABLED
 #define HAL_FLASH_MODULE_ENABLED
@@ -36,6 +37,7 @@
 #include "stm32f4xx_hal_pwr.h"
 #include "stm32f4xx_hal_sram.h"
 #include "stm32f4xx_hal_uart.h"
+#include "stm32f4xx_hal_can.h"
 
 #ifdef USE_FULL_ASSERT
 void assert_failed(uint8_t *file, uint32_t line);

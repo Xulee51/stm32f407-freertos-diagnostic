@@ -20,6 +20,7 @@
 #define IWDG_RELOAD_VALUE 1500U /* 约 3 秒，实际值随 LSI 频率变化 */
 #define SUPERVISOR_GRACE_TICKS pdMS_TO_TICKS(2000)
 #define UI_REFRESH_TICKS pdMS_TO_TICKS(500)
+#define CAN_TASK_STACK_WORDS 256U
 
 #define LCD_COLOR_BLUE 0x001FU
 #define LCD_COLOR_WHITE 0xFFFFU
@@ -37,7 +38,8 @@ enum {
     EVT_BOOT_OK = 1U << 0,    /* main() 创建完对象后置位 */
     EVT_LOGGER_OK = 1U << 1,  /* logger 任务进入循环前置位 */
     EVT_UI_OK = 1U << 2,      /* ui 任务进入循环前置位 */
-    EVT_INPUT_OK = 1U << 3    /* input 任务进入循环前置位 */
+    EVT_INPUT_OK = 1U << 3,   /* input 任务进入循环前置位 */
+    EVT_CAN_OK = 1U << 4      /* CAN1 回环启动及中断通知成功 */
 };
 
 typedef enum {
@@ -56,7 +58,7 @@ typedef struct {
 /* 任务间日志消息：tick 为发送时刻，text 为负载（不含换行） */
 typedef struct {
     uint32_t tick;
-    char text[128];
+    char text[192];
 } log_message_t;
 
 static QueueHandle_t log_queue;           /* health -> logger，容量 8 条 */
@@ -66,23 +68,32 @@ static TaskHandle_t health_task_handle;
 static TaskHandle_t logger_task_handle;
 static TaskHandle_t input_task_handle;
 static TaskHandle_t ui_task_handle;
+static TaskHandle_t can_task_handle;
 static volatile uint32_t log_queue_dropped;
 static volatile uint32_t ui_event_dropped;
 static volatile uint32_t logger_heartbeat;
 static volatile uint32_t input_heartbeat;
 static volatile uint32_t ui_heartbeat;
+static volatile uint32_t can_heartbeat;
+static volatile uint32_t can_tx_count;
+static volatile uint32_t can_rx_count;
+static volatile uint32_t can_error_count;
+static volatile uint32_t can_irq_count;
 static volatile uint32_t touch_irq_count;
 static uint8_t lcd_ready;
 static uint8_t touch_ready;
+CAN_HandleTypeDef hcan1;
 
 static void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
+static HAL_StatusTypeDef MX_CAN1_Init(void);
 static void MX_IWDG_Init(void);
 static void logger_task(void *argument);
 static void health_task(void *argument);
 static void input_task(void *argument);
 static void ui_task(void *argument);
+static void can_task(void *argument);
 static void uart_write(const char *text);
 static void ui_render_status(const ui_event_t *last_event,
                              uint32_t event_count);
@@ -125,6 +136,12 @@ int main(void)
         uart_write("[TP] CST716 init FAILED\r\n");
     }
 
+    if (MX_CAN1_Init() == HAL_OK) {
+        uart_write("[CAN] CAN1 internal-loopback init OK\r\n");
+    } else {
+        uart_write("[CAN] CAN1 init FAILED\r\n");
+    }
+
     log_queue = xQueueCreate(LOG_QUEUE_LENGTH, sizeof(log_message_t));
     ui_event_queue = xQueueCreate(UI_EVENT_QUEUE_LENGTH, sizeof(ui_event_t));
     health_events = xEventGroupCreate();
@@ -134,10 +151,10 @@ int main(void)
     }
 
     /*
-     * 四个任务：health 采状态，logger 统一出串口，input 采集触摸，
-     * ui 独占 LCD 并消费 UI 事件。输入和显示分开，便于定位阻塞来源。
-     * 普通任务栈 384 word，input 使用 256 word；优先级为 health=4、
-     * logger=3、input=2、ui=1。
+     * 五个任务：health 采状态，logger 统一出串口，input 采集触摸，
+     * ui 独占 LCD 并消费 UI 事件，can 执行内部回环诊断。
+     * 普通任务栈 384 word，input/can 使用 256 word；优先级为 health=4、
+     * logger=3、input=2、can=2、ui=1。
      */
     if (xTaskCreate(health_task, "health", TASK_STACK_WORDS, NULL, 4,
                     &health_task_handle) != pdPASS ||
@@ -146,7 +163,9 @@ int main(void)
         xTaskCreate(input_task, "input", INPUT_TASK_STACK_WORDS, NULL, 2,
                     &input_task_handle) != pdPASS ||
         xTaskCreate(ui_task, "ui", TASK_STACK_WORDS, NULL, 1,
-                    &ui_task_handle) != pdPASS) {
+                    &ui_task_handle) != pdPASS ||
+        xTaskCreate(can_task, "can", CAN_TASK_STACK_WORDS, NULL, 2,
+                    &can_task_handle) != pdPASS) {
         Error_Handler();
     }
 
@@ -172,12 +191,14 @@ static void health_task(void *argument)
     uint32_t last_logger_heartbeat = 0U;
     uint32_t last_input_heartbeat = 0U;
     uint32_t last_ui_heartbeat = 0U;
+    uint32_t last_can_heartbeat = 0U;
     for (;;) {
         EventBits_t bits = xEventGroupGetBits(health_events);
         UBaseType_t health_hwm = uxTaskGetStackHighWaterMark(health_task_handle);
         UBaseType_t logger_hwm = uxTaskGetStackHighWaterMark(logger_task_handle);
         UBaseType_t input_hwm = uxTaskGetStackHighWaterMark(input_task_handle);
         UBaseType_t ui_hwm = uxTaskGetStackHighWaterMark(ui_task_handle);
+        UBaseType_t can_hwm = uxTaskGetStackHighWaterMark(can_task_handle);
         size_t free_heap = xPortGetFreeHeapSize();
         size_t min_free_heap = xPortGetMinimumEverFreeHeapSize();
         TickType_t now = xTaskGetTickCount();
@@ -191,10 +212,14 @@ static void health_task(void *argument)
         } else if ((now >= SUPERVISOR_GRACE_TICKS) &&
                    (ui_heartbeat == last_ui_heartbeat)) {
             supervisor = "ui_stalled";
+        } else if ((now >= SUPERVISOR_GRACE_TICKS) &&
+                   (can_heartbeat == last_can_heartbeat)) {
+            supervisor = "can_stalled";
         }
         snprintf(message.text, sizeof(message.text),
                  "health bits=0x%02lx heap=%lu min_heap=%lu qdrop=%lu "
-                 "edrop=%lu tirq=%lu stack_hwm=%lu/%lu/%lu/%lu "
+                 "edrop=%lu tirq=%lu can=%lu/%lu irq=%lu cerr=%lu "
+                 "stack_hwm=%lu/%lu/%lu/%lu/%lu "
                  "supervisor=%s wd=ok",
                  (unsigned long)bits,
                  (unsigned long)free_heap,
@@ -202,10 +227,15 @@ static void health_task(void *argument)
                  (unsigned long)log_queue_dropped,
                  (unsigned long)ui_event_dropped,
                  (unsigned long)touch_irq_count,
+                 (unsigned long)can_tx_count,
+                 (unsigned long)can_rx_count,
+                 (unsigned long)can_irq_count,
+                 (unsigned long)can_error_count,
                  (unsigned long)health_hwm,
                  (unsigned long)logger_hwm,
                  (unsigned long)input_hwm,
                  (unsigned long)ui_hwm,
+                 (unsigned long)can_hwm,
                  supervisor);
         message.tick = now;
         /* 超时 20 ms：队列满时丢弃本条，避免 health 被 logger 拖死 */
@@ -245,6 +275,7 @@ static void health_task(void *argument)
         last_logger_heartbeat = logger_heartbeat;
         last_input_heartbeat = input_heartbeat;
         last_ui_heartbeat = ui_heartbeat;
+        last_can_heartbeat = can_heartbeat;
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000));
     }
 }
@@ -257,7 +288,7 @@ static void logger_task(void *argument)
 {
     (void)argument;
     log_message_t message;
-    char line[192];
+    char line[256];
     xEventGroupSetBits(health_events, EVT_LOGGER_OK);
     for (;;) {
 #if DIAG_FAULT_MODE == 3
@@ -382,7 +413,7 @@ static void ui_render_status(const ui_event_t *last_event,
                          600U, LCD_COLOR_BLUE);
     LCD_ILI9806_DrawText(28U, 220U, "RTOS", LCD_COLOR_WHITE, 3U);
 
-    snprintf(line, sizeof(line), "HEALTH%02lu", (unsigned long)(bits & 0x0FU));
+    snprintf(line, sizeof(line), "HEALTH%02lu", (unsigned long)(bits & 0x1FU));
     LCD_ILI9806_DrawText(28U, 270U, line, LCD_COLOR_CYAN, 3U);
     snprintf(line, sizeof(line), "HEAP%05lu",
              (unsigned long)xPortGetFreeHeapSize());
@@ -398,6 +429,104 @@ static void ui_render_status(const ui_event_t *last_event,
     LCD_ILI9806_DrawText(28U, 570U, line, LCD_COLOR_CYAN, 3U);
 }
 
+/*
+ * CAN task: send one standard frame per second and wait for the RX FIFO0
+ * notification generated by the internal loopback path. The ISR only wakes
+ * this task; HAL_CAN_GetRxMessage() stays in task context.
+ */
+static void can_task(void *argument)
+{
+    (void)argument;
+    CAN_TxHeaderTypeDef tx_header = {0};
+    CAN_RxHeaderTypeDef rx_header = {0};
+    uint8_t tx_data[8] = {0x43U, 0x41U, 0x4EU, 0x30U, 0U, 0U, 0U, 0U};
+    uint8_t rx_data[8] = {0U};
+    TickType_t wake = xTaskGetTickCount();
+    uint32_t tx_mailbox = 0U;
+    uint8_t can_ready = 0U;
+
+    tx_header.StdId = 0x321U;
+    tx_header.ExtId = 0U;
+    tx_header.IDE = CAN_ID_STD;
+    tx_header.RTR = CAN_RTR_DATA;
+    tx_header.DLC = 4U;
+    tx_header.TransmitGlobalTime = DISABLE;
+
+    HAL_StatusTypeDef start_status = HAL_CAN_Start(&hcan1);
+    if (start_status != HAL_OK) {
+        log_message_t message = {0};
+        message.tick = xTaskGetTickCount();
+        snprintf(message.text, sizeof(message.text),
+                 "CAN start FAILED err=0x%08lx state=%lu "
+                 "mcr=0x%08lx msr=0x%08lx btr=0x%08lx apb1=0x%08lx "
+                 "dbgmcu=0x%08lx rx=%lu",
+                 (unsigned long)HAL_CAN_GetError(&hcan1),
+                 (unsigned long)hcan1.State,
+                 (unsigned long)CAN1->MCR,
+                 (unsigned long)CAN1->MSR,
+                 (unsigned long)CAN1->BTR,
+                 (unsigned long)RCC->APB1ENR,
+                 (unsigned long)DBGMCU->APB1FZ,
+                 (unsigned long)((GPIOA->IDR & GPIO_PIN_11) != 0U));
+        if (xQueueSend(log_queue, &message, 0U) != pdPASS) {
+            log_queue_dropped++;
+        }
+    } else if (HAL_CAN_ActivateNotification(
+                   &hcan1,
+                   CAN_IT_RX_FIFO0_MSG_PENDING | CAN_IT_ERROR) == HAL_OK) {
+        can_ready = 1U;
+        xEventGroupSetBits(health_events, EVT_CAN_OK);
+    } else {
+        log_message_t message = {0};
+        message.tick = xTaskGetTickCount();
+        snprintf(message.text, sizeof(message.text),
+                 "CAN notify FAILED err=0x%08lx state=%lu",
+                 (unsigned long)HAL_CAN_GetError(&hcan1),
+                 (unsigned long)hcan1.State);
+        if (xQueueSend(log_queue, &message, 0U) != pdPASS) {
+            log_queue_dropped++;
+        }
+    }
+
+    for (;;) {
+        if (can_ready != 0U) {
+            tx_data[3]++;
+            if (HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data,
+                                     &tx_mailbox) == HAL_OK) {
+                can_tx_count++;
+            } else {
+                can_error_count++;
+            }
+
+            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+            while (HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) != 0U) {
+                if (HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0,
+                                         &rx_header, rx_data) == HAL_OK) {
+                    log_message_t message;
+                    can_rx_count++;
+                    message.tick = xTaskGetTickCount();
+                    snprintf(message.text, sizeof(message.text),
+                             "CAN loopback rx id=0x%03lx dlc=%u data=%02x%02x%02x%02x",
+                             (unsigned long)rx_header.StdId,
+                             (unsigned int)rx_header.DLC,
+                             rx_data[0], rx_data[1], rx_data[2], rx_data[3]);
+                    if (xQueueSend(log_queue, &message, 0U) != pdPASS) {
+                        log_queue_dropped++;
+                    }
+                } else {
+                    can_error_count++;
+                    break;
+                }
+            }
+            (void)HAL_CAN_ActivateNotification(&hcan1,
+                                               CAN_IT_RX_FIFO0_MSG_PENDING |
+                                               CAN_IT_ERROR);
+        }
+        can_heartbeat++;
+        vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000));
+    }
+}
+
 /* Called by HAL_GPIO_EXTI_IRQHandler() from EXTI1_IRQHandler(). */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
@@ -410,6 +539,29 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
                                    &higher_priority_task_woken);
             portYIELD_FROM_ISR(higher_priority_task_woken);
         }
+    }
+}
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *can_handle)
+{
+    if ((can_handle != NULL) && (can_handle->Instance == CAN1)) {
+        BaseType_t higher_priority_task_woken = pdFALSE;
+        can_irq_count++;
+        /* Prevent a level-triggered FIFO-pending IRQ storm while the task drains FIFO0. */
+        __HAL_CAN_DISABLE_IT(can_handle, CAN_IT_RX_FIFO0_MSG_PENDING);
+        if ((can_task_handle != NULL) &&
+            (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)) {
+            vTaskNotifyGiveFromISR(can_task_handle,
+                                   &higher_priority_task_woken);
+            portYIELD_FROM_ISR(higher_priority_task_woken);
+        }
+    }
+}
+
+void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *can_handle)
+{
+    if ((can_handle != NULL) && (can_handle->Instance == CAN1)) {
+        can_error_count++;
     }
 }
 
@@ -438,6 +590,76 @@ static void MX_USART1_UART_Init(void)
 static void MX_GPIO_Init(void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();  /* USART1 的 PA9/PA10 所在端口 */
+}
+
+/* CAN1 board contract: PA11=RX, PA12=TX, AF9. */
+void HAL_CAN_MspInit(CAN_HandleTypeDef *can_handle)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    if ((can_handle == NULL) || (can_handle->Instance != CAN1)) {
+        return;
+    }
+    __HAL_RCC_CAN1_CLK_ENABLE();
+    __HAL_RCC_CAN1_FORCE_RESET();
+    __HAL_RCC_CAN1_RELEASE_RESET();
+    __HAL_DBGMCU_UNFREEZE_CAN1();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    /* bxCAN must observe recessive RX before INAK can clear. PA11 has a
+     * weak pull-up so an open P9 jumper does not leave CAN_RX floating low. */
+    gpio.Pin = GPIO_PIN_11;
+    gpio.Mode = GPIO_MODE_AF_PP;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio.Alternate = GPIO_AF9_CAN1;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    gpio.Pin = GPIO_PIN_12;
+    gpio.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 5U, 0U);
+    HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
+    HAL_NVIC_SetPriority(CAN1_SCE_IRQn, 5U, 0U);
+    HAL_NVIC_EnableIRQ(CAN1_SCE_IRQn);
+}
+
+static HAL_StatusTypeDef MX_CAN1_Init(void)
+{
+    hcan1.Instance = CAN1;
+    hcan1.Init.Prescaler = 6U;       /* 42 MHz / (6 * 14 TQ) = 500 kbit/s */
+    /* Silent loopback disconnects the physical CAN bus from the self-test. */
+    hcan1.Init.Mode = CAN_MODE_SILENT_LOOPBACK;
+    hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
+    hcan1.Init.TimeSeg1 = CAN_BS1_11TQ;
+    hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
+    hcan1.Init.TimeTriggeredMode = DISABLE;
+    hcan1.Init.AutoBusOff = ENABLE;
+    hcan1.Init.AutoWakeUp = DISABLE;
+    hcan1.Init.AutoRetransmission = ENABLE;
+    hcan1.Init.ReceiveFifoLocked = DISABLE;
+    hcan1.Init.TransmitFifoPriority = DISABLE;
+    if (HAL_CAN_Init(&hcan1) != HAL_OK) {
+        return HAL_ERROR;
+    }
+
+    /* Do not let a debugger freeze bit or a stale wake-up flag block start. */
+    CLEAR_BIT(hcan1.Instance->MCR, CAN_MCR_DBF);
+    __HAL_CAN_CLEAR_FLAG(&hcan1, CAN_FLAG_WKU);
+
+    CAN_FilterTypeDef filter = {0};
+    filter.FilterBank = 0U;
+    filter.FilterMode = CAN_FILTERMODE_IDMASK;
+    filter.FilterScale = CAN_FILTERSCALE_32BIT;
+    filter.FilterIdHigh = 0U;
+    filter.FilterIdLow = 0U;
+    filter.FilterMaskIdHigh = 0U;
+    filter.FilterMaskIdLow = 0U;
+    filter.FilterFIFOAssignment = CAN_RX_FIFO0;
+    filter.FilterActivation = ENABLE;
+    filter.SlaveStartFilterBank = 14U;
+    return HAL_CAN_ConfigFilter(&hcan1, &filter);
 }
 
 /* IWDG 使用 LSI，独立于主时钟；health_task 每秒刷新一次。 */

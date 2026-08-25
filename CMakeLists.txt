@@ -41,6 +41,7 @@ set(FIRMWARE_SOURCES
     Core/Startup/startup_stm32f407xx.s
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_cortex.c
+    Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_can.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_dma.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_flash.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_flash_ex.c

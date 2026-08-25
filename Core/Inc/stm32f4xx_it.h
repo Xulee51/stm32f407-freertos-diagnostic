@@ -10,5 +10,7 @@ void UsageFault_Handler(void);
 void DebugMon_Handler(void);
 void SysTick_Handler(void);
 void EXTI1_IRQHandler(void);
+void CAN1_RX0_IRQHandler(void);
+void CAN1_SCE_IRQHandler(void);
 
 #endif
