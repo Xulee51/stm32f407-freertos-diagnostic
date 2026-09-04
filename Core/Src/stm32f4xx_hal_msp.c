@@ -26,4 +26,9 @@ void HAL_UART_MspInit(UART_HandleTypeDef *uart)
     gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     gpio.Alternate = GPIO_AF7_USART1;
     HAL_GPIO_Init(GPIOA, &gpio);
+
+    /* 节点 10：使能 USART1 NVIC，优先级 5，与 CAN/触摸一致，
+     * 不超过 FreeRTOS configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY。 */
+    HAL_NVIC_SetPriority(USART1_IRQn, 5U, 0U);
+    HAL_NVIC_EnableIRQ(USART1_IRQn);
 }

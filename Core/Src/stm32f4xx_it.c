@@ -41,3 +41,9 @@ void CAN1_SCE_IRQHandler(void)
 {
     HAL_CAN_IRQHandler(&hcan1);
 }
+
+/* 节点 10：USART1 RX 中断入口，交给 HAL 状态机，再回调应用层。 */
+void USART1_IRQHandler(void)
+{
+    HAL_UART_IRQHandler(&huart1);
+}

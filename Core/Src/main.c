@@ -80,6 +80,8 @@ static volatile uint32_t can_rx_count;
 static volatile uint32_t can_error_count;
 static volatile uint32_t can_irq_count;
 static volatile uint32_t touch_irq_count;
+static volatile uint32_t uart_rx_count;   /* 节点 10：USART1 RX 收到的字节数 */
+static uint8_t uart_rx_byte;              /* 单字节 RX 缓冲，由 HAL_UART_Receive_IT 使用 */
 static uint8_t lcd_ready;
 static uint8_t touch_ready;
 CAN_HandleTypeDef hcan1;
@@ -104,6 +106,10 @@ int main(void)
     SystemClock_Config();       /* 8 MHz HSE -> PLL -> 168 MHz SYSCLK */
     MX_GPIO_Init();
     MX_USART1_UART_Init();
+
+    /* 节点 10 第 1 步：启动 USART1 单字节 RX 中断，回调只计数并重新装填，
+     * 不调用 FreeRTOS API，因此调度器启动前后都安全。 */
+    (void)HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1U);
 
     const uint32_t iwdg_reset = (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST) != RESET) ? 1U : 0U;
     __HAL_RCC_CLEAR_RESET_FLAGS();
@@ -218,7 +224,7 @@ static void health_task(void *argument)
         }
         snprintf(message.text, sizeof(message.text),
                  "health bits=0x%02lx heap=%lu min_heap=%lu qdrop=%lu "
-                 "edrop=%lu tirq=%lu can=%lu/%lu irq=%lu cerr=%lu "
+                 "edrop=%lu tirq=%lu can=%lu/%lu irq=%lu cerr=%lu urx=%lu "
                  "stack_hwm=%lu/%lu/%lu/%lu/%lu "
                  "supervisor=%s wd=ok",
                  (unsigned long)bits,
@@ -231,6 +237,7 @@ static void health_task(void *argument)
                  (unsigned long)can_rx_count,
                  (unsigned long)can_irq_count,
                  (unsigned long)can_error_count,
+                 (unsigned long)uart_rx_count,
                  (unsigned long)health_hwm,
                  (unsigned long)logger_hwm,
                  (unsigned long)input_hwm,
@@ -562,6 +569,25 @@ void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *can_handle)
 {
     if ((can_handle != NULL) && (can_handle->Instance == CAN1)) {
         can_error_count++;
+    }
+}
+
+/* 节点 10 第 1 步：每收到一个字节计数一次并重新装填 RX 中断。
+ * 只做计数和重新启动，不做解析、格式化或发送，保持 ISR 短小；
+ * 不调用 FreeRTOS API，调度器未启动时也安全。 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if ((huart != NULL) && (huart->Instance == USART1)) {
+        uart_rx_count++;
+        (void)HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1U);
+    }
+}
+
+/* 节点 10：overrun/framing 等错误会中止 RX IT，这里重新装填，避免卡死。 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if ((huart != NULL) && (huart->Instance == USART1)) {
+        (void)HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1U);
     }
 }
 
