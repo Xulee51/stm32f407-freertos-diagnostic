@@ -2,14 +2,27 @@
 
 这是全新建立的 STM32F407ZGT6 工程，不继承旧日历工程的业务代码。
 
-当前基线：
+当前已验证开发基线（节点 0–8）：
 
 - 8 MHz HSE -> 168 MHz SYSCLK；
 - USART1 PA9/PA10，115200-8-N-1；
 - FreeRTOS 1 kHz Tick；
-- `health`、`logger`、`ui` 三个最小任务；
-- Queue、Event Group、Heap/Stack 异常钩子；
+- `health`、`logger`、`input`、`can`、`ui` 五个任务；
+- Queue、Event Group、任务通知、Heap/Stack 异常钩子；
+- IWDG、任务心跳监督和编译期故障注入；
+- ILI9806/FSMC LCD、CST716 软件 I2C + EXTI 触摸输入；
+- CAN1 500 kbit/s 静默内部回环；
 - HAL、CMSIS、FreeRTOS 源码来自 ST 官方 STM32CubeF4 仓库。
+
+2026-08-25 的 CAN1 实机回归连续运行 45 秒，稳定结果为：
+
+```text
+health bits=0x1f ... qdrop=0 edrop=0 ... can=45/45 irq=45 cerr=0 ... supervisor=ok wd=ok
+```
+
+这证明当前 MCU 内部 CAN 控制器、FIFO、中断、任务通知和日志链路可用；不等于 TJA1040、CANH/CANL、ACK、Bus-Off 或外部 CAN 节点通信已经通过。
+
+项目节点、分支集成状态和下一步计划见 [`PROJECT_STATUS.md`](PROJECT_STATUS.md)。
 
 ## Windows 开发环境
 
@@ -88,12 +101,24 @@ cmake --build --preset debug
 cmake --build --preset debug
 ```
 
+## 当前软件结构
+
+| 任务 | 优先级 | 职责 |
+| --- | ---: | --- |
+| `health_task` | 4 | 汇总健康位、Heap/Stack、丢包、触摸/CAN 计数，监督任务心跳并刷新 IWDG |
+| `logger_task` | 3 | 独占 USART1 发送路径，输出队列中的日志 |
+| `input_task` | 2 | 等待 CST716 EXTI 通知并保留周期轮询，产生 UI 事件 |
+| `can_task` | 2 | 每秒执行一次 CAN1 静默内部回环并处理 RX FIFO0 |
+| `ui_task` | 1 | 独占 ILI9806/FSMC，消费 UI 事件并刷新状态页 |
+
+`log_queue` 用于统一串口输出，`ui_event_queue` 用于隔离触摸采集和 LCD 刷新，ISR 只做 HAL 中断处理和任务通知，不在中断上下文执行软件 I2C、LCD 绘图或日志格式化。
+
 ## FreeRTOS 诊断指标与故障注入
 
-正常固件每秒输出当前 Heap、历史最小 Heap、队列丢包数、三个任务的栈高水位（单位：word）以及看门狗状态：
+正常固件每秒输出当前 Heap、历史最小 Heap、日志/UI 队列丢包数、触摸/CAN 中断与收发计数、五个任务的栈高水位（单位：word）、监督器和看门狗状态：
 
 ```text
-[      1000] health bits=0x07 heap=... min_heap=... qdrop=0 stack_hwm=.../.../... wd=ok
+[      1000] health bits=0x1f heap=... min_heap=... qdrop=0 edrop=0 tirq=... can=.../... irq=... cerr=0 stack_hwm=.../.../.../.../... supervisor=ok wd=ok
 ```
 
 IWDG 使用 LSI，约 3 秒超时，由 `health_task` 每秒刷新。启动日志会报告上一次是否由 IWDG 复位：
@@ -145,6 +170,14 @@ cmake --build --preset debug --target flash
 
 迁移验收期间暂时保留 Makefile 和旧脚本作为内部回退入口，但文档和日常调试只提供 Git Bash + CMake 命令。
 
-串口预期每秒输出 `health bits` 和 FreeRTOS 剩余 Heap。LCD、触摸、以太网、CAN、RS485 将在基线验收后按阶段加入。
+## 文档索引
 
-学习过程中的问题与解释记录在 [`docs/学习笔记.md`](docs/学习笔记.md)。
+- [`PROJECT_STATUS.md`](PROJECT_STATUS.md)：节点 0–9、当前分支集成状态和节点 10 UART CLI 计划；
+- [`docs/board_pin_map.md`](docs/board_pin_map.md)：板级引脚与资源合同；
+- [`docs/lcd_bringup.md`](docs/lcd_bringup.md)：ILI9806/FSMC 最小验收；
+- [`docs/touch_cst716_bringup.md`](docs/touch_cst716_bringup.md)：CST716 轮询与 EXTI 验收；
+- [`docs/ui_event_lcd_bringup.md`](docs/ui_event_lcd_bringup.md)：UI 事件队列和 LCD 状态页；
+- [`docs/can_bringup.md`](docs/can_bringup.md)：CAN 板级合同与内部回环证据；
+- [`docs/学习笔记.md`](docs/学习笔记.md)：问题、原理、代码位置和实机证据。
+
+Ethernet/LAN8720A、W25Q128、RS485、电机、ESP8266 和外部 CAN 总线尚未集成。每个新模块都应继续采用“板级合同 -> 最小驱动 -> 可观察指标 -> 故障注入/实机验收”的增量方式加入。
