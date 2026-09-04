@@ -5,6 +5,7 @@
 #include "task.h"
 #include "queue.h"
 #include "event_groups.h"
+#include "stream_buffer.h"
 #include "portable.h"
 #include <stdio.h>
 #include <string.h>
@@ -21,6 +22,9 @@
 #define SUPERVISOR_GRACE_TICKS pdMS_TO_TICKS(2000)
 #define UI_REFRESH_TICKS pdMS_TO_TICKS(500)
 #define CAN_TASK_STACK_WORDS 256U
+#define CLI_TASK_STACK_WORDS 256U
+#define CLI_RX_STREAM_SIZE   128U  /* RX 字节流容量 */
+#define CLI_LINE_MAX         96U   /* 单行最大长度（不含结尾 NUL） */
 
 #define LCD_COLOR_BLUE 0x001FU
 #define LCD_COLOR_WHITE 0xFFFFU
@@ -39,7 +43,8 @@ enum {
     EVT_LOGGER_OK = 1U << 1,  /* logger 任务进入循环前置位 */
     EVT_UI_OK = 1U << 2,      /* ui 任务进入循环前置位 */
     EVT_INPUT_OK = 1U << 3,   /* input 任务进入循环前置位 */
-    EVT_CAN_OK = 1U << 4      /* CAN1 回环启动及中断通知成功 */
+    EVT_CAN_OK = 1U << 4,     /* CAN1 回环启动及中断通知成功 */
+    EVT_CLI_OK = 1U << 5      /* cli 任务进入循环前置位 */
 };
 
 typedef enum {
@@ -69,18 +74,25 @@ static TaskHandle_t logger_task_handle;
 static TaskHandle_t input_task_handle;
 static TaskHandle_t ui_task_handle;
 static TaskHandle_t can_task_handle;
+static TaskHandle_t cli_task_handle;
+static StreamBufferHandle_t cli_rx_stream;  /* USART1 RX 字节流，trigger=1 */
+static uint8_t cli_rx_storage[CLI_RX_STREAM_SIZE + 1U]; /* FreeRTOS 要求 +1 */
+static StaticStreamBuffer_t cli_rx_stream_ctrl;
 static volatile uint32_t log_queue_dropped;
 static volatile uint32_t ui_event_dropped;
 static volatile uint32_t logger_heartbeat;
 static volatile uint32_t input_heartbeat;
 static volatile uint32_t ui_heartbeat;
 static volatile uint32_t can_heartbeat;
+static volatile uint32_t cli_heartbeat;
 static volatile uint32_t can_tx_count;
 static volatile uint32_t can_rx_count;
 static volatile uint32_t can_error_count;
 static volatile uint32_t can_irq_count;
 static volatile uint32_t touch_irq_count;
 static volatile uint32_t uart_rx_count;   /* 节点 10：USART1 RX 收到的字节数 */
+static volatile uint32_t cli_rx_overflow;  /* RX stream 写入失败（满）计数 */
+static volatile uint32_t cli_line_overflow;/* 行缓冲超长丢弃计数 */
 static uint8_t uart_rx_byte;              /* 单字节 RX 缓冲，由 HAL_UART_Receive_IT 使用 */
 static uint8_t lcd_ready;
 static uint8_t touch_ready;
@@ -96,6 +108,7 @@ static void health_task(void *argument);
 static void input_task(void *argument);
 static void ui_task(void *argument);
 static void can_task(void *argument);
+static void cli_task(void *argument);
 static void uart_write(const char *text);
 static void ui_render_status(const ui_event_t *last_event,
                              uint32_t event_count);
@@ -151,16 +164,19 @@ int main(void)
     log_queue = xQueueCreate(LOG_QUEUE_LENGTH, sizeof(log_message_t));
     ui_event_queue = xQueueCreate(UI_EVENT_QUEUE_LENGTH, sizeof(ui_event_t));
     health_events = xEventGroupCreate();
+    cli_rx_stream = xStreamBufferCreateStatic(CLI_RX_STREAM_SIZE, 1U,
+                                              cli_rx_storage,
+                                              &cli_rx_stream_ctrl);
     if ((log_queue == NULL) || (ui_event_queue == NULL) ||
-        (health_events == NULL)) {
+        (health_events == NULL) || (cli_rx_stream == NULL)) {
         Error_Handler();        /* Heap 不足或创建失败，停机便于排查 */
     }
 
     /*
-     * 五个任务：health 采状态，logger 统一出串口，input 采集触摸，
-     * ui 独占 LCD 并消费 UI 事件，can 执行内部回环诊断。
-     * 普通任务栈 384 word，input/can 使用 256 word；优先级为 health=4、
-     * logger=3、input=2、can=2、ui=1。
+     * 六个任务：health 采状态，logger 统一出串口，input 采集触摸，
+     * ui 独占 LCD 并消费 UI 事件，can 执行内部回环诊断，
+     * cli 组装 USART1 RX 行。普通任务栈 384 word，input/can/cli 使用 256 word；
+     * 优先级为 health=4、logger=3、input=2、can=2、cli=2、ui=1。
      */
     if (xTaskCreate(health_task, "health", TASK_STACK_WORDS, NULL, 4,
                     &health_task_handle) != pdPASS ||
@@ -171,7 +187,9 @@ int main(void)
         xTaskCreate(ui_task, "ui", TASK_STACK_WORDS, NULL, 1,
                     &ui_task_handle) != pdPASS ||
         xTaskCreate(can_task, "can", CAN_TASK_STACK_WORDS, NULL, 2,
-                    &can_task_handle) != pdPASS) {
+                    &can_task_handle) != pdPASS ||
+        xTaskCreate(cli_task, "cli", CLI_TASK_STACK_WORDS, NULL, 2,
+                    &cli_task_handle) != pdPASS) {
         Error_Handler();
     }
 
@@ -198,6 +216,7 @@ static void health_task(void *argument)
     uint32_t last_input_heartbeat = 0U;
     uint32_t last_ui_heartbeat = 0U;
     uint32_t last_can_heartbeat = 0U;
+    uint32_t last_cli_heartbeat = 0U;
     for (;;) {
         EventBits_t bits = xEventGroupGetBits(health_events);
         UBaseType_t health_hwm = uxTaskGetStackHighWaterMark(health_task_handle);
@@ -205,6 +224,7 @@ static void health_task(void *argument)
         UBaseType_t input_hwm = uxTaskGetStackHighWaterMark(input_task_handle);
         UBaseType_t ui_hwm = uxTaskGetStackHighWaterMark(ui_task_handle);
         UBaseType_t can_hwm = uxTaskGetStackHighWaterMark(can_task_handle);
+        UBaseType_t cli_hwm = uxTaskGetStackHighWaterMark(cli_task_handle);
         size_t free_heap = xPortGetFreeHeapSize();
         size_t min_free_heap = xPortGetMinimumEverFreeHeapSize();
         TickType_t now = xTaskGetTickCount();
@@ -221,11 +241,15 @@ static void health_task(void *argument)
         } else if ((now >= SUPERVISOR_GRACE_TICKS) &&
                    (can_heartbeat == last_can_heartbeat)) {
             supervisor = "can_stalled";
+        } else if ((now >= SUPERVISOR_GRACE_TICKS) &&
+                   (cli_heartbeat == last_cli_heartbeat)) {
+            supervisor = "cli_stalled";
         }
         snprintf(message.text, sizeof(message.text),
                  "health bits=0x%02lx heap=%lu min_heap=%lu qdrop=%lu "
                  "edrop=%lu tirq=%lu can=%lu/%lu irq=%lu cerr=%lu urx=%lu "
-                 "stack_hwm=%lu/%lu/%lu/%lu/%lu "
+                 "rxovf=%lu clovf=%lu "
+                 "stack_hwm=%lu/%lu/%lu/%lu/%lu/%lu "
                  "supervisor=%s wd=ok",
                  (unsigned long)bits,
                  (unsigned long)free_heap,
@@ -238,11 +262,14 @@ static void health_task(void *argument)
                  (unsigned long)can_irq_count,
                  (unsigned long)can_error_count,
                  (unsigned long)uart_rx_count,
+                 (unsigned long)cli_rx_overflow,
+                 (unsigned long)cli_line_overflow,
                  (unsigned long)health_hwm,
                  (unsigned long)logger_hwm,
                  (unsigned long)input_hwm,
                  (unsigned long)ui_hwm,
                  (unsigned long)can_hwm,
+                 (unsigned long)cli_hwm,
                  supervisor);
         message.tick = now;
         /* 超时 20 ms：队列满时丢弃本条，避免 health 被 logger 拖死 */
@@ -283,6 +310,7 @@ static void health_task(void *argument)
         last_input_heartbeat = input_heartbeat;
         last_ui_heartbeat = ui_heartbeat;
         last_can_heartbeat = can_heartbeat;
+        last_cli_heartbeat = cli_heartbeat;
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000));
     }
 }
@@ -420,7 +448,7 @@ static void ui_render_status(const ui_event_t *last_event,
                          600U, LCD_COLOR_BLUE);
     LCD_ILI9806_DrawText(28U, 220U, "RTOS", LCD_COLOR_WHITE, 3U);
 
-    snprintf(line, sizeof(line), "HEALTH%02lu", (unsigned long)(bits & 0x1FU));
+    snprintf(line, sizeof(line), "HEALTH%02lu", (unsigned long)(bits & 0x3FU));
     LCD_ILI9806_DrawText(28U, 270U, line, LCD_COLOR_CYAN, 3U);
     snprintf(line, sizeof(line), "HEAP%05lu",
              (unsigned long)xPortGetFreeHeapSize());
@@ -534,6 +562,88 @@ static void can_task(void *argument)
     }
 }
 
+/*
+ * 节点 10 第 2 步：CLI 任务从 StreamBuffer 取字节，逐字节组行。
+ * 支持 CR/LF/CRLF 行结束、退格、空行、超过 CLI_LINE_MAX 的超长行丢弃恢复。
+ * 本步只把组装好的整行原样回显到 log_queue，由 logger 统一输出，
+ * 不直接访问 USART1 TX，也不解析命令。
+ */
+static void cli_emit_line(char *text, size_t len)
+{
+    log_message_t message;
+    if (len > CLI_LINE_MAX) {
+        len = CLI_LINE_MAX;
+    }
+    text[len] = '\0';
+    message.tick = xTaskGetTickCount();
+    if (len == 0U) {
+        (void)snprintf(message.text, sizeof(message.text), "[CLI] (empty line)");
+    } else {
+        (void)snprintf(message.text, sizeof(message.text), "[CLI] echo: %s", text);
+    }
+    if (xQueueSend(log_queue, &message, 0U) != pdPASS) {
+        log_queue_dropped++;
+    }
+}
+
+static void cli_task(void *argument)
+{
+    (void)argument;
+    char line[CLI_LINE_MAX + 1U];   /* +1 留给 NUL */
+    size_t len = 0U;
+    uint8_t buf[16];
+    uint8_t prev_was_cr = 0U;
+    uint8_t discarding_line = 0U;
+    xEventGroupSetBits(health_events, EVT_CLI_OK);
+    for (;;) {
+        /* 有限超时而非 portMAX_DELAY：空闲时也要周期返回以递增心跳，
+         * 否则 supervisor 会判定 cli_stalled 并停止刷新 IWDG。 */
+        size_t got = xStreamBufferReceive(cli_rx_stream, buf, sizeof(buf),
+                                          pdMS_TO_TICKS(500));
+        for (size_t i = 0U; i < got; ++i) {
+            uint8_t c = buf[i];
+            if (c == '\n') {
+                if (prev_was_cr != 0U) {
+                    /* CRLF 的 LF：CR 已结束该行，跳过避免空行 */
+                    prev_was_cr = 0U;
+                } else if (discarding_line == 0U) {
+                    cli_emit_line(line, len);
+                    len = 0U;
+                } else {
+                    discarding_line = 0U;
+                    len = 0U;
+                }
+            } else if (c == '\r') {
+                if (discarding_line == 0U) {
+                    cli_emit_line(line, len);
+                }
+                discarding_line = 0U;
+                len = 0U;
+                prev_was_cr = 1U;
+            } else if ((c == '\b') || (c == 0x7FU)) {
+                prev_was_cr = 0U;
+                if ((discarding_line == 0U) && (len > 0U)) {
+                    len--;
+                }
+            } else if ((c >= 0x20U) && (c < 0x7FU)) {
+                prev_was_cr = 0U;
+                if (discarding_line != 0U) {
+                    /* 丢弃直到 CR/LF，不把尾部拼成新行 */
+                } else if (len < CLI_LINE_MAX) {
+                    line[len++] = (char)c;
+                } else {
+                    cli_line_overflow++;
+                    discarding_line = 1U;
+                    len = 0U;
+                }
+            } else {
+                prev_was_cr = 0U;   /* 其他控制字符忽略 */
+            }
+        }
+        cli_heartbeat++;
+    }
+}
+
 /* Called by HAL_GPIO_EXTI_IRQHandler() from EXTI1_IRQHandler(). */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
@@ -572,14 +682,23 @@ void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *can_handle)
     }
 }
 
-/* 节点 10 第 1 步：每收到一个字节计数一次并重新装填 RX 中断。
- * 只做计数和重新启动，不做解析、格式化或发送，保持 ISR 短小；
- * 不调用 FreeRTOS API，调度器未启动时也安全。 */
+/* 节点 10 第 2 步：每收到一个字节写入 StreamBuffer 并通知 cli_task，
+ * 再重新装填 RX 中断。仍不做解析、格式化或发送；FromISR API 在调度器
+ * 运行后才调用，启动阶段只计数并重新装填。 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if ((huart != NULL) && (huart->Instance == USART1)) {
         uart_rx_count++;
+        BaseType_t higher_priority_task_woken = pdFALSE;
+        if ((cli_task_handle != NULL) && (cli_rx_stream != NULL) &&
+            (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)) {
+            if (xStreamBufferSendFromISR(cli_rx_stream, &uart_rx_byte, 1U,
+                                         &higher_priority_task_woken) == 0U) {
+                cli_rx_overflow++;
+            }
+        }
         (void)HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1U);
+        portYIELD_FROM_ISR(higher_priority_task_woken);
     }
 }
 
@@ -748,6 +867,29 @@ void Error_Handler(void)
 void vApplicationMallocFailedHook(void)
 {
     Error_Handler();  /* FreeRTOS Heap 分配失败（configUSE_MALLOC_FAILED_HOOK=1） */
+}
+
+/* configSUPPORT_STATIC_ALLOCATION=1 时，Idle/Timer 必须由应用提供静态栈与 TCB。 */
+void vApplicationGetIdleTaskMemory(StaticTask_t **tcb_buffer,
+                                   StackType_t **stack_buffer,
+                                   uint32_t *stack_size)
+{
+    static StaticTask_t idle_tcb;
+    static StackType_t idle_stack[configMINIMAL_STACK_SIZE];
+    *tcb_buffer = &idle_tcb;
+    *stack_buffer = idle_stack;
+    *stack_size = configMINIMAL_STACK_SIZE;
+}
+
+void vApplicationGetTimerTaskMemory(StaticTask_t **tcb_buffer,
+                                    StackType_t **stack_buffer,
+                                    uint32_t *stack_size)
+{
+    static StaticTask_t timer_tcb;
+    static StackType_t timer_stack[configTIMER_TASK_STACK_DEPTH];
+    *tcb_buffer = &timer_tcb;
+    *stack_buffer = timer_stack;
+    *stack_size = configTIMER_TASK_STACK_DEPTH;
 }
 
 void vApplicationStackOverflowHook(TaskHandle_t task, char *name)

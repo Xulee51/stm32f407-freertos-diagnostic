@@ -18,6 +18,8 @@ extern uint32_t SystemCoreClock;
 #define configUSE_RECURSIVE_MUTEXES              0
 #define configUSE_COUNTING_SEMAPHORES            1
 #define configUSE_TASK_NOTIFICATIONS             1
+#define configSUPPORT_STATIC_ALLOCATION          1  /* 节点 10：静态 StreamBuffer 需要 */
+#define configSUPPORT_DYNAMIC_ALLOCATION         1  /* 现有 Queue/任务仍用 heap */
 #define configUSE_QUEUE_SETS                     0
 #define configUSE_TIMERS                         1
 #define configTIMER_TASK_PRIORITY                2
