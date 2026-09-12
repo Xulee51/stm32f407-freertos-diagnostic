@@ -1,6 +1,7 @@
 #include "main.h"
 #include "lcd_ili9806.h"
 #include "cst716.h"
+#include "cli_parse.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
@@ -9,6 +10,7 @@
 #include "portable.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
 
 #ifndef DIAG_FAULT_MODE
 #define DIAG_FAULT_MODE 0
@@ -22,7 +24,7 @@
 #define SUPERVISOR_GRACE_TICKS pdMS_TO_TICKS(2000)
 #define UI_REFRESH_TICKS pdMS_TO_TICKS(500)
 #define CAN_TASK_STACK_WORDS 256U
-#define CLI_TASK_STACK_WORDS 256U
+#define CLI_TASK_STACK_WORDS 384U  /* tasks 突发回复 + vsnprintf 峰值约 220 word，384 留余量 */
 #define CLI_RX_STREAM_SIZE   128U  /* RX 字节流容量 */
 #define CLI_LINE_MAX         96U   /* 单行最大长度（不含结尾 NUL） */
 
@@ -93,6 +95,15 @@ static volatile uint32_t touch_irq_count;
 static volatile uint32_t uart_rx_count;   /* 节点 10：USART1 RX 收到的字节数 */
 static volatile uint32_t cli_rx_overflow;  /* RX stream 写入失败（满）计数 */
 static volatile uint32_t cli_line_overflow;/* 行缓冲超长丢弃计数 */
+static volatile uint32_t cli_unknown_count; /* 未知命令计数 */
+static volatile uint32_t cli_reply_dropped; /* CLI 回复送入 log_queue 失败计数 */
+static const char *supervisor_state = "ok"; /* health_task 每秒更新的监督结论 */
+static uint32_t boot_reset_iwdg;            /* 1=上次由 IWDG 复位 */
+static uint16_t touch_fw_version;           /* CST716 固件版本号 */
+static volatile uint16_t touch_last_x;      /* 最近一次触摸坐标快照，供 CLI 查询 */
+static volatile uint16_t touch_last_y;
+static volatile uint8_t touch_last_type;    /* 0=无事件 1=按下 2=释放 */
+static volatile uint32_t touch_event_count;
 static uint8_t uart_rx_byte;              /* 单字节 RX 缓冲，由 HAL_UART_Receive_IT 使用 */
 static uint8_t lcd_ready;
 static uint8_t touch_ready;
@@ -126,6 +137,7 @@ int main(void)
 
     const uint32_t iwdg_reset = (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST) != RESET) ? 1U : 0U;
     __HAL_RCC_CLEAR_RESET_FLAGS();
+    boot_reset_iwdg = iwdg_reset;
 
     /* 调度器尚未启动，这里直接写串口，证明时钟和 USART1 已可用 */
     uart_write("\r\n[BOOT] freertos_robot_diagnostic\r\n");
@@ -146,6 +158,7 @@ int main(void)
     uint16_t touch_version = 0U;
     if (CST716_Init(&touch_version) == HAL_OK) {
         touch_ready = 1U;
+        touch_fw_version = touch_version;
         char touch_line[64];
         snprintf(touch_line, sizeof(touch_line),
                  "[TP] CST716 init OK version=0x%04x exti=both+poll\r\n",
@@ -175,7 +188,8 @@ int main(void)
     /*
      * 六个任务：health 采状态，logger 统一出串口，input 采集触摸，
      * ui 独占 LCD 并消费 UI 事件，can 执行内部回环诊断，
-     * cli 组装 USART1 RX 行。普通任务栈 384 word，input/can/cli 使用 256 word；
+     * cli 组装 USART1 RX 行并执行只读命令。普通任务栈 384 word，
+     * input/can 使用 256 word；
      * 优先级为 health=4、logger=3、input=2、can=2、cli=2、ui=1。
      */
     if (xTaskCreate(health_task, "health", TASK_STACK_WORDS, NULL, 4,
@@ -245,10 +259,11 @@ static void health_task(void *argument)
                    (cli_heartbeat == last_cli_heartbeat)) {
             supervisor = "cli_stalled";
         }
+        supervisor_state = supervisor;
         snprintf(message.text, sizeof(message.text),
                  "health bits=0x%02lx heap=%lu min_heap=%lu qdrop=%lu "
                  "edrop=%lu tirq=%lu can=%lu/%lu irq=%lu cerr=%lu urx=%lu "
-                 "rxovf=%lu clovf=%lu "
+                 "rxovf=%lu clovf=%lu cunk=%lu rdrop=%lu "
                  "stack_hwm=%lu/%lu/%lu/%lu/%lu/%lu "
                  "supervisor=%s wd=ok",
                  (unsigned long)bits,
@@ -264,6 +279,8 @@ static void health_task(void *argument)
                  (unsigned long)uart_rx_count,
                  (unsigned long)cli_rx_overflow,
                  (unsigned long)cli_line_overflow,
+                 (unsigned long)cli_unknown_count,
+                 (unsigned long)cli_reply_dropped,
                  (unsigned long)health_hwm,
                  (unsigned long)logger_hwm,
                  (unsigned long)input_hwm,
@@ -407,6 +424,10 @@ static void ui_task(void *argument)
             log_message_t message;
             last_event = event;
             event_count++;
+            touch_last_x = event.x;
+            touch_last_y = event.y;
+            touch_last_type = (uint8_t)event.type;
+            touch_event_count = event_count;
             message.tick = event.tick;
             if (event.type == UI_EVENT_TOUCH_PRESS) {
                 snprintf(message.text, sizeof(message.text),
@@ -445,7 +466,7 @@ static void ui_render_status(const ui_event_t *last_event,
 
     /* Only redraw the status panel; the startup test pattern remains above. */
     LCD_ILI9806_FillRect(20U, 210U, LCD_ILI9806_WIDTH - 21U,
-                         600U, LCD_COLOR_BLUE);
+                         670U, LCD_COLOR_BLUE);
     LCD_ILI9806_DrawText(28U, 220U, "RTOS", LCD_COLOR_WHITE, 3U);
 
     snprintf(line, sizeof(line), "HEALTH%02lu", (unsigned long)(bits & 0x3FU));
@@ -462,6 +483,10 @@ static void ui_render_status(const ui_event_t *last_event,
     LCD_ILI9806_DrawText(28U, 520U, line, LCD_COLOR_WHITE, 3U);
     snprintf(line, sizeof(line), "DROP%03lu", (unsigned long)ui_event_dropped);
     LCD_ILI9806_DrawText(28U, 570U, line, LCD_COLOR_CYAN, 3U);
+    /* 节点 10 第 5 步：LCD 状态页纳入 CLI 错误计数（未知命令 + 行溢出）。 */
+    snprintf(line, sizeof(line), "CLIE%03lu",
+             (unsigned long)(cli_unknown_count + cli_line_overflow));
+    LCD_ILI9806_DrawText(28U, 620U, line, LCD_COLOR_WHITE, 3U);
 }
 
 /*
@@ -563,26 +588,142 @@ static void can_task(void *argument)
 }
 
 /*
- * 节点 10 第 2 步：CLI 任务从 StreamBuffer 取字节，逐字节组行。
- * 支持 CR/LF/CRLF 行结束、退格、空行、超过 CLI_LINE_MAX 的超长行丢弃恢复。
- * 本步只把组装好的整行原样回显到 log_queue，由 logger 统一输出，
- * 不直接访问 USART1 TX，也不解析命令。
+ * 节点 10 第 4 步：只读命令实现。所有回复经 log_queue 由 logger 统一输出，
+ * CLI 不直接访问 USART1 TX。回复发送失败计入 cli_reply_dropped（rdrop），
+ * 不占 qdrop，便于区分周期日志丢失与交互回复丢失。
  */
-static void cli_emit_line(char *text, size_t len)
+static void cli_reply(const char *fmt, ...)
 {
     log_message_t message;
+    va_list args;
+    message.tick = xTaskGetTickCount();
+    va_start(args, fmt);
+    (void)vsnprintf(message.text, sizeof(message.text), fmt, args);
+    va_end(args);
+    if (xQueueSend(log_queue, &message, 0U) != pdPASS) {
+        cli_reply_dropped++;
+    }
+}
+
+static void cli_cmd_help(void)
+{
+    cli_reply("[CLI] commands: help status tasks can touch version");
+    cli_reply("[CLI] usage: <cmd> [args], max %u args, line<=%uB, read-only",
+              (unsigned int)CLI_PARSE_MAX_ARGS, (unsigned int)CLI_LINE_MAX);
+}
+
+static void cli_cmd_status(void)
+{
+    /* 先复制快照再格式化，避免输出过程中读到互相矛盾的计数 */
+    EventBits_t bits = xEventGroupGetBits(health_events);
+    size_t free_heap = xPortGetFreeHeapSize();
+    size_t min_free_heap = xPortGetMinimumEverFreeHeapSize();
+    uint32_t qdrop = log_queue_dropped;
+    uint32_t edrop = ui_event_dropped;
+    uint32_t rxovf = cli_rx_overflow;
+    uint32_t clovf = cli_line_overflow;
+    uint32_t cunk = cli_unknown_count;
+    uint32_t rdrop = cli_reply_dropped;
+    const char *sup = supervisor_state;
+    const char *last_reset = (boot_reset_iwdg != 0U) ? "IWDG" : "other";
+    cli_reply("[CLI] status bits=0x%02lx heap=%lu min_heap=%lu qdrop=%lu "
+              "edrop=%lu rxovf=%lu clovf=%lu cunk=%lu rdrop=%lu",
+              (unsigned long)bits, (unsigned long)free_heap,
+              (unsigned long)min_free_heap, (unsigned long)qdrop,
+              (unsigned long)edrop, (unsigned long)rxovf,
+              (unsigned long)clovf, (unsigned long)cunk, (unsigned long)rdrop);
+    cli_reply("[CLI] status supervisor=%s wd=ok last_reset=%s", sup, last_reset);
+}
+
+static void cli_cmd_tasks(void)
+{
+    cli_reply("[CLI] tasks: name prio stack_hwm heartbeat");
+    cli_reply("[CLI] task health p=4 hwm=%lu hb=-",
+              (unsigned long)uxTaskGetStackHighWaterMark(health_task_handle));
+    cli_reply("[CLI] task logger p=3 hwm=%lu hb=%lu",
+              (unsigned long)uxTaskGetStackHighWaterMark(logger_task_handle),
+              (unsigned long)logger_heartbeat);
+    cli_reply("[CLI] task input  p=2 hwm=%lu hb=%lu",
+              (unsigned long)uxTaskGetStackHighWaterMark(input_task_handle),
+              (unsigned long)input_heartbeat);
+    cli_reply("[CLI] task ui     p=1 hwm=%lu hb=%lu",
+              (unsigned long)uxTaskGetStackHighWaterMark(ui_task_handle),
+              (unsigned long)ui_heartbeat);
+    cli_reply("[CLI] task can    p=2 hwm=%lu hb=%lu",
+              (unsigned long)uxTaskGetStackHighWaterMark(can_task_handle),
+              (unsigned long)can_heartbeat);
+    cli_reply("[CLI] task cli    p=2 hwm=%lu hb=%lu",
+              (unsigned long)uxTaskGetStackHighWaterMark(cli_task_handle),
+              (unsigned long)cli_heartbeat);
+}
+
+static void cli_cmd_can(void)
+{
+    uint32_t tx = can_tx_count;
+    uint32_t rx = can_rx_count;
+    uint32_t irq = can_irq_count;
+    uint32_t cerr = can_error_count;
+    cli_reply("[CLI] can mode=silent-loopback baud=500k tx=%lu rx=%lu "
+              "irq=%lu cerr=%lu",
+              (unsigned long)tx, (unsigned long)rx,
+              (unsigned long)irq, (unsigned long)cerr);
+    cli_reply("[CLI] can note: internal loopback only; TJA1040/CANH/CANL/ACK "
+              "not validated");
+}
+
+static void cli_cmd_touch(void)
+{
+    uint8_t ready = touch_ready;
+    uint16_t ver = touch_fw_version;
+    uint16_t x = touch_last_x;
+    uint16_t y = touch_last_y;
+    uint8_t type = touch_last_type;
+    uint32_t events = touch_event_count;
+    uint32_t tirq = touch_irq_count;
+    uint32_t edrop = ui_event_dropped;
+    cli_reply("[CLI] touch ready=%u ver=0x%04x x=%u y=%u type=%u events=%lu "
+              "tirq=%lu edrop=%lu",
+              (unsigned int)ready, (unsigned int)ver,
+              (unsigned int)x, (unsigned int)y, (unsigned int)type,
+              (unsigned long)events, (unsigned long)tirq,
+              (unsigned long)edrop);
+}
+
+static void cli_cmd_version(void)
+{
+    cli_reply("[CLI] version freertos_robot_diagnostic build=%s git=%s",
+              FW_BUILD_TYPE, FW_GIT_HASH);
+}
+
+static void cli_handle_line(char *text, size_t len)
+{
+    cli_parse_result_t parsed;
+    int too_many;
+
     if (len > CLI_LINE_MAX) {
         len = CLI_LINE_MAX;
     }
     text[len] = '\0';
-    message.tick = xTaskGetTickCount();
-    if (len == 0U) {
-        (void)snprintf(message.text, sizeof(message.text), "[CLI] (empty line)");
+    too_many = cli_parse_line(text, &parsed);
+    if (parsed.id == CLI_CMD_EMPTY) {
+        cli_reply("[CLI] (empty line)");
+    } else if (too_many != 0) {
+        cli_reply("[CLI] err: too many args, max %u",
+                  (unsigned int)CLI_PARSE_MAX_ARGS);
+    } else if (parsed.id == CLI_CMD_UNKNOWN) {
+        cli_unknown_count++;
+        cli_reply("[CLI] err: unknown '%s', try help",
+                  (parsed.argv[0] != NULL) ? parsed.argv[0] : "?");
     } else {
-        (void)snprintf(message.text, sizeof(message.text), "[CLI] echo: %s", text);
-    }
-    if (xQueueSend(log_queue, &message, 0U) != pdPASS) {
-        log_queue_dropped++;
+        switch (parsed.id) {
+        case CLI_CMD_HELP:    cli_cmd_help();    break;
+        case CLI_CMD_STATUS:  cli_cmd_status();  break;
+        case CLI_CMD_TASKS:   cli_cmd_tasks();   break;
+        case CLI_CMD_CAN:     cli_cmd_can();     break;
+        case CLI_CMD_TOUCH:   cli_cmd_touch();   break;
+        case CLI_CMD_VERSION: cli_cmd_version(); break;
+        default:              break;
+        }
     }
 }
 
@@ -607,7 +748,7 @@ static void cli_task(void *argument)
                     /* CRLF 的 LF：CR 已结束该行，跳过避免空行 */
                     prev_was_cr = 0U;
                 } else if (discarding_line == 0U) {
-                    cli_emit_line(line, len);
+                    cli_handle_line(line, len);
                     len = 0U;
                 } else {
                     discarding_line = 0U;
@@ -615,7 +756,7 @@ static void cli_task(void *argument)
                 }
             } else if (c == '\r') {
                 if (discarding_line == 0U) {
-                    cli_emit_line(line, len);
+                    cli_handle_line(line, len);
                 }
                 discarding_line = 0U;
                 len = 0U;

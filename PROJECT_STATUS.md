@@ -1,21 +1,22 @@
 # 项目状态与路线图
 
-更新时间：2026-08-26
+更新时间：2026-09-13
 
 ## 当前开发检查点
 
 | 项目 | 状态 |
 | --- | --- |
 | 当前开发分支 | `feature/can-loopback` |
-| 节点 8 提交 | `a7339d5`（本地与 `origin/feature/can-loopback` 一致） |
-| 集成基线 | STM32F407ZGT6，168 MHz，FreeRTOS，USART1，IWDG，ILI9806，CST716，CAN1 静默内部回环 |
-| 实机健康位 | `0x1f`：boot/logger/ui/input/CAN 均已就绪 |
-| CAN 回环证据 | 连续 45 秒：`can=45/45`、`irq=45`、`cerr=0` |
-| 系统证据 | `qdrop=0`、`edrop=0`、`supervisor=ok`、`wd=ok` |
+| 最新提交 | 节点 10 改动已实机验收，commit/push 由用户手动执行 |
+| 集成基线 | STM32F407ZGT6，168 MHz，FreeRTOS，USART1，IWDG，ILI9806，CST716，CAN1 静默内部回环，UART 只读 CLI |
+| 实机健康位 | `0x3f`：boot/logger/ui/input/CAN/CLI 均已就绪 |
+| CLI 证据 | `help/status/tasks/can/touch/version` 全部有界输出；未知命令 `cunk` 计数；空行、超长行（>96B）可恢复 |
+| CAN 回环证据 | CLI 交互期间持续 `can=93/93`、`irq=93`、`cerr=0` |
+| 系统证据 | `qdrop=0`、`edrop=0`、`rxovf=0`、`clovf=0`、`rdrop=0`、`supervisor=ok`、`wd=ok` |
 
-`develop` 当前仍在 `834557f`，尚未包含 LCD、触摸、UI 事件层和 CAN 增量。节点 9 先在当前功能分支建立一致的文档检查点；是否合入 `develop` 由代码复核和用户手动 commit/push 后决定。
+`develop` 当前仍在 `834557f`，尚未包含 LCD、触摸、UI 事件层、CAN 和 CLI 增量。是否合入 `develop` 由代码复核和用户手动 commit/push 后决定。
 
-仓库中的 `local/` 用于本地硬件资料，不属于固件交付内容，本节点不修改也不纳入版本控制。
+仓库中的 `local/` 用于本地硬件资料，不属于固件交付内容，不纳入版本控制。
 
 ## 节点进度
 
@@ -30,12 +31,32 @@
 | 6 | FreeRTOS UI 事件层和 LCD 状态页 | 完成；`input_task -> ui_event_queue -> ui_task`，`edrop=0` |
 | 7 | CAN1 原理图与跳帽合同 | 完成；PA11/PA12、P9、TJA1040、P7、R18 已记录 |
 | 8 | CAN1 静默内部回环 | 完成；`health bits=0x1f`、45/45 帧、45 次 IRQ、0 错误 |
-| 9 | 整合当前开发版本和项目文档 | 完成，待用户复核并手动提交；README 与本文件形成当前交付入口 |
-| 10 | UART CLI | 已规划，尚未实现 |
+| 9 | 整合当前开发版本和项目文档 | 完成；`10125fa`，README 与 PROJECT_STATUS 形成交付入口 |
+| 10 | UART 只读 CLI | 完成；六条命令实机通过，`health bits=0x3f`，解析层有主机侧单元测试 |
 
 节点 8 的边界必须保留：内部回环只验证 MCU 内部 bxCAN 和软件链路，外部 TJA1040、CANH/CANL、ACK、错误状态和 Bus-Off 恢复仍是后续独立节点。
 
-## 节点 10：UART CLI 计划
+## 节点 10：UART CLI（已完成）
+
+### 实机验收结果（2026-09-13）
+
+- 六条命令全部有界输出：`help`/`status`/`can` 各两行，`tasks` 七行，`touch`/`version` 各一行；
+- `version` 输出 `build=Debug git=<short-hash>`，哈希由 CMake 在配置阶段捕获；
+- 未知命令 `foo` 返回 `err: unknown 'foo', try help` 且 `cunk=1`；空回车返回 `(empty line)`；
+- 超过 96 字节的行整行丢弃，`clovf` 每条只加 1，不回显残余，后续命令正常；
+- 交互期间 `health bits=0x3f`、`can=TX=RX=IRQ` 持续递增、`cerr=0`、`qdrop=0`、`edrop=0`、`rxovf=0`、`rdrop=0`、`supervisor=ok`、`wd=ok`；
+- 触摸按压/释放与 LCD 状态页在 CLI 在线时仍正常；
+- 解析层 `Core/Src/cli_parse.c` 不依赖 HAL/FreeRTOS，主机侧测试：`tools/run_cli_parse_tests.sh`（无主机 gcc 时自动改用 `tests/cli_parse_test.py`）。
+
+### 验收中修复的问题
+
+- `cli_task` 曾用 `portMAX_DELAY` 阻塞接收，空闲时心跳不递增，被 supervisor 判为 `cli_stalled` 并停止刷新 IWDG，导致约 3 秒复位循环；改为 500 ms 超时后空闲心跳正常；
+- 组行缓冲在 `%s` 输出前必须显式写 `'\0'`；
+- 超长行需要独立的 discard-until-CR/LF 状态，仅清零长度会把尾部拼成下一行；
+- 启用 `configSUPPORT_STATIC_ALLOCATION=1` 后必须提供 `vApplicationGetIdleTaskMemory()` 和 `vApplicationGetTimerTaskMemory()`；
+- `tasks` 突发回复 + `vsnprintf` 峰值约 220 word 栈，cli 栈定为 384 word。
+
+### 原始计划（存档）
 
 ### 目标与边界
 

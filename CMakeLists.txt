@@ -32,6 +32,23 @@ set(MCU_FLAGS
     -mfloat-abi=hard
 )
 
+# 节点 10：version 命令的可追踪版本标识。git 哈希在配置阶段捕获，
+# 新提交后需重新运行 cmake --preset 才会刷新。
+find_package(Git QUIET)
+set(FW_GIT_HASH "unknown")
+if(GIT_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE FW_GIT_HASH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(NOT FW_GIT_HASH)
+        set(FW_GIT_HASH "unknown")
+    endif()
+endif()
+
 set(FIRMWARE_SOURCES
     Core/Src/main.c
     Core/Src/stm32f4xx_it.c
@@ -56,6 +73,7 @@ set(FIRMWARE_SOURCES
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_ll_fsmc.c
     Core/Src/lcd_ili9806.c
     Core/Src/cst716.c
+    Core/Src/cli_parse.c
     Middlewares/FreeRTOS/Source/croutine.c
     Middlewares/FreeRTOS/Source/event_groups.c
     Middlewares/FreeRTOS/Source/list.c
@@ -76,6 +94,8 @@ target_compile_definitions(${TARGET_NAME} PRIVATE
     DIAG_FAULT_MODE=${DIAG_FAULT_MODE_VALUE}
     LCD_ILI9806_LANDSCAPE=${LCD_ILI9806_LANDSCAPE}
     LCD_BACKLIGHT_ACTIVE_HIGH=${LCD_BACKLIGHT_ACTIVE_HIGH}
+    FW_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+    FW_GIT_HASH="${FW_GIT_HASH}"
 )
 
 target_include_directories(${TARGET_NAME} PRIVATE

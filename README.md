@@ -2,16 +2,17 @@
 
 这是全新建立的 STM32F407ZGT6 工程，不继承旧日历工程的业务代码。
 
-当前已验证开发基线（节点 0–8）：
+当前已验证开发基线（节点 0–10）：
 
 - 8 MHz HSE -> 168 MHz SYSCLK；
 - USART1 PA9/PA10，115200-8-N-1；
 - FreeRTOS 1 kHz Tick；
-- `health`、`logger`、`input`、`can`、`ui` 五个任务；
+- `health`、`logger`、`input`、`can`、`cli`、`ui` 六个任务；
 - Queue、Event Group、任务通知、Heap/Stack 异常钩子；
 - IWDG、任务心跳监督和编译期故障注入；
 - ILI9806/FSMC LCD、CST716 软件 I2C + EXTI 触摸输入；
 - CAN1 500 kbit/s 静默内部回环；
+- USART1 只读命令行（`help`/`status`/`tasks`/`can`/`touch`/`version`）；
 - HAL、CMSIS、FreeRTOS 源码来自 ST 官方 STM32CubeF4 仓库。
 
 2026-08-25 的 CAN1 实机回归连续运行 45 秒，稳定结果为：
@@ -21,6 +22,14 @@ health bits=0x1f ... qdrop=0 edrop=0 ... can=45/45 irq=45 cerr=0 ... supervisor=
 ```
 
 这证明当前 MCU 内部 CAN 控制器、FIFO、中断、任务通知和日志链路可用；不等于 TJA1040、CANH/CANL、ACK、Bus-Off 或外部 CAN 节点通信已经通过。
+
+2026-09-13 的节点 10 实机验收中，CLI 在线交互期间系统持续稳定：
+
+```text
+health bits=0x3f ... urx=... rxovf=0 clovf=0 cunk=1 rdrop=0 ... can=93/93 irq=93 cerr=0 ... supervisor=ok wd=ok
+```
+
+六条只读命令均有确定且有界的输出，未知命令、空行和超过 96 字节的输入都可计数并恢复，触摸、LCD 和 CAN 回环行为不退化。
 
 项目节点、分支集成状态和下一步计划见 [`PROJECT_STATUS.md`](PROJECT_STATUS.md)。
 
@@ -105,21 +114,27 @@ cmake --build --preset debug
 
 | 任务 | 优先级 | 职责 |
 | --- | ---: | --- |
-| `health_task` | 4 | 汇总健康位、Heap/Stack、丢包、触摸/CAN 计数，监督任务心跳并刷新 IWDG |
+| `health_task` | 4 | 汇总健康位、Heap/Stack、丢包、触摸/CAN/CLI 计数，监督任务心跳并刷新 IWDG |
 | `logger_task` | 3 | 独占 USART1 发送路径，输出队列中的日志 |
 | `input_task` | 2 | 等待 CST716 EXTI 通知并保留周期轮询，产生 UI 事件 |
 | `can_task` | 2 | 每秒执行一次 CAN1 静默内部回环并处理 RX FIFO0 |
+| `cli_task` | 2 | 从 RX StreamBuffer 组行、解析并执行只读命令，回复写入日志队列 |
 | `ui_task` | 1 | 独占 ILI9806/FSMC，消费 UI 事件并刷新状态页 |
 
-`log_queue` 用于统一串口输出，`ui_event_queue` 用于隔离触摸采集和 LCD 刷新，ISR 只做 HAL 中断处理和任务通知，不在中断上下文执行软件 I2C、LCD 绘图或日志格式化。
+`log_queue` 用于统一串口输出，`ui_event_queue` 用于隔离触摸采集和 LCD 刷新，ISR 只做 HAL 中断处理、字节搬运和任务通知，不在中断上下文执行软件 I2C、LCD 绘图、命令解析或日志格式化。
 
 ## FreeRTOS 诊断指标与故障注入
 
-正常固件每秒输出当前 Heap、历史最小 Heap、日志/UI 队列丢包数、触摸/CAN 中断与收发计数、五个任务的栈高水位（单位：word）、监督器和看门狗状态：
+正常固件每秒输出当前 Heap、历史最小 Heap、日志/UI 队列丢包数、触摸/CAN 中断与收发计数、CLI 接收与解析计数、六个任务的栈高水位（单位：word）、监督器和看门狗状态：
 
 ```text
-[      1000] health bits=0x1f heap=... min_heap=... qdrop=0 edrop=0 tirq=... can=.../... irq=... cerr=0 stack_hwm=.../.../.../.../... supervisor=ok wd=ok
+[      1000] health bits=0x3f heap=... min_heap=... qdrop=0 edrop=0 tirq=... can=.../... irq=... cerr=0 urx=... rxovf=0 clovf=0 cunk=0 rdrop=0 stack_hwm=.../.../.../.../.../... supervisor=ok wd=ok
 ```
+
+- `bits` 按位表示 boot/logger/ui/input/can/cli 六个应用任务的就绪状态，正常为 `0x3f`；
+- `urx` 为 USART1 RX 中断累计字节数，`rxovf` 为 RX StreamBuffer 溢出次数；
+- `clovf` 为超长命令行（>96 字节）丢弃次数，`cunk` 为未知命令数，`rdrop` 为 CLI 回复被日志队列丢弃的次数；
+- `stack_hwm` 依次对应 health/logger/input/ui/can/cli 六个任务。
 
 IWDG 使用 LSI，约 3 秒超时，由 `health_task` 每秒刷新。启动日志会报告上一次是否由 IWDG 复位：
 
@@ -166,13 +181,42 @@ cmake --build --preset debug --target flash
 - `freertos_robot_diagnostic.map`；
 - `compile_commands.json`。
 
+## UART 命令行（CLI）
+
+固件运行期间可在 USART1 日志口直接输入只读命令（以 `CR`、`LF` 或 `CRLF` 结尾，每行最长 96 字节、最多 6 个参数，支持退格）：
+
+| 命令 | 输出 |
+| --- | --- |
+| `help` | 命令列表和参数格式 |
+| `status` | 健康位、Heap、队列丢包、supervisor、IWDG 状态 |
+| `tasks` | 六个应用任务的优先级、栈高水位和心跳摘要 |
+| `can` | 模式、波特率、TX/RX、IRQ、错误计数和"仅内部回环"边界 |
+| `touch` | 触摸初始化状态、最近坐标、事件数、EXTI 和丢包计数 |
+| `version` | 固件名称、构建类型和 git 短哈希 |
+
+设计边界：
+
+- 第一版只读：不提供烧录、复位、CAN 模式切换、Flash 修改或故障注入命令；
+- RX ISR 只把字节写入静态 StreamBuffer，解析、格式化和发送都在 `cli_task`/`logger_task` 上下文完成；
+- 状态查询先复制快照再格式化，避免输出过程中读到互相矛盾的计数；
+- CLI 回复统一走 `log_queue`，USART1 TX 仍由 `logger_task` 独占；回复丢弃只计入 `rdrop`，不混入 `qdrop`；
+- 未知命令返回 `err: unknown '<cmd>', try help` 并计入 `cunk`；超长行整行丢弃并计入 `clovf`，之后自动恢复。
+
+命令解析层 `Core/Src/cli_parse.c` 不依赖 HAL/FreeRTOS，可在主机侧做单元测试：
+
+```bash
+tools/run_cli_parse_tests.sh
+```
+
+有主机 gcc 时编译运行 C 测试，否则自动改用 Python 参考实现 `tests/cli_parse_test.py` 交叉核对。
+
 ## 旧构建入口
 
 迁移验收期间暂时保留 Makefile 和旧脚本作为内部回退入口，但文档和日常调试只提供 Git Bash + CMake 命令。
 
 ## 文档索引
 
-- [`PROJECT_STATUS.md`](PROJECT_STATUS.md)：节点 0–9、当前分支集成状态和节点 10 UART CLI 计划；
+- [`PROJECT_STATUS.md`](PROJECT_STATUS.md)：节点 0–10、当前分支集成状态和下一步计划；
 - [`docs/board_pin_map.md`](docs/board_pin_map.md)：板级引脚与资源合同；
 - [`docs/lcd_bringup.md`](docs/lcd_bringup.md)：ILI9806/FSMC 最小验收；
 - [`docs/touch_cst716_bringup.md`](docs/touch_cst716_bringup.md)：CST716 轮询与 EXTI 验收；
